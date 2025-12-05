@@ -25,9 +25,9 @@ if "setup_done" not in st.session_state:
         st.session_state.setup_done = True
 
 # ==========================================
-# ブラウザ操作
+# ブラウザ操作（年齢確認ボタンをクリックする処理を追加）
 # ==========================================
-def fetch_html_via_route(target_url):
+def fetch_html_bypass_age_gate(target_url):
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -40,12 +40,28 @@ def fetch_html_via_route(target_url):
         try:
             # 1. 入り口URLへ
             page.goto(FIXED_ENTRY_URL, timeout=30000)
-            time.sleep(3) 
+            time.sleep(2) 
 
             # 2. 目的のURLへ
             page.goto(target_url, timeout=30000)
-            page.wait_for_load_state("networkidle")
+            page.wait_for_load_state("domcontentloaded") # 読み込み待ち
 
+            # === 【追加】年齢確認ボタンを探して押す ===
+            # よくあるボタンの言葉をリストアップして、見つけたらクリックする
+            age_keywords = ["はい", "Yes", "YES", "Enter", "18歳以上", "Entry", "入場", "承諾"]
+            
+            for word in age_keywords:
+                try:
+                    # 画面内にその言葉を含むボタンやリンクがあればクリック（タイムアウト短め）
+                    # 見つからなければエラーになるので無視して次へ
+                    page.get_by_text(word).first.click(timeout=500)
+                    print(f"Clicked: {word}")
+                    time.sleep(1) # クリック後の画面遷移待ち
+                    break # 1つ押せたら終了
+                except:
+                    continue
+            
+            # 3. 最終的なHTMLを取得
             return page.content()
 
         except Exception as e:
@@ -55,91 +71,89 @@ def fetch_html_via_route(target_url):
             browser.close()
 
 # ==========================================
-# 抽出ロジック（引き算方式）
+# 抽出ロジック（CSS維持 ＋ ポップアップ強制削除）
 # ==========================================
-def clean_html_keep_css(html_content, target_url):
+def clean_html_remove_popups(html_content, target_url):
     soup = BeautifulSoup(html_content, 'html.parser')
 
-    # 1. <base>タグを追加して、CSSや画像のリンク切れを防ぐ
-    # 既存のheadを取得、なければ作る
+    # 1. Base URL設定
     if not soup.head:
-        new_head = soup.new_tag("head")
-        soup.insert(0, new_head)
+        soup.insert(0, soup.new_tag("head"))
     
-    # baseタグをheadの先頭に追加
     base_tag = soup.new_tag("base", href=target_url)
     if soup.head.base:
         soup.head.base.replace_with(base_tag)
     else:
         soup.head.insert(0, base_tag)
 
-    # 2. 明らかに不要なタグだけをピンポイントで削除（引き算）
-    # 本文が含まれる可能性がある div や table は消さない！
-    garbage_tags = [
-        "script",     # プログラム
-        "noscript",   # プログラムなし用表示
-        "iframe",     # 外部埋め込み（広告など）
-        "form",       # 入力フォーム
-        "button",     # ボタン
-        "input",      # 入力欄
-        "nav",        # ナビゲーションメニュー
-        "footer",     # フッター（著作権表示など）
-        "header",     # ヘッダー（ロゴなど）
-    ]
-    
+    # 2. 不要タグ削除（imgは残すか消すか選べます。今回は消す設定）
+    garbage_tags = ["script", "noscript", "iframe", "form", "button", "input", "nav", "footer", "header"]
     for tag_name in garbage_tags:
         for tag in soup.find_all(tag_name):
             tag.decompose()
 
-    # 3. 画像を表示するかどうか（今回は「文字だけ見たい」要望に合わせて非表示にするCSSを追加）
-    # 画像も見たければ、以下の style タグの img 部分を消してください
+    # 3. 【強力】ポップアップを強制的に消すCSSを注入
+    # どんなIDかわからないため、「画面全体を覆う系」のCSSプロパティを無効化し、
+    # スクロール禁止(overflow: hidden)を解除する
     custom_style = soup.new_tag("style")
     custom_style.string = """
-        body { background-color: #fff !important; font-family: sans-serif; }
-        /* 画像を非表示にする（レイアウト崩れ防止のため display:none 推奨） */
+        body { 
+            background-color: #fff !important; 
+            font-family: sans-serif; 
+            overflow: auto !important; /* スクロール禁止を強制解除 */
+            height: auto !important;
+        }
         img { display: none !important; }
-        /* 画面幅をスマホっぽく調整 */
-        .wrapper, #wrapper, .container { width: 100% !important; max-width: 100% !important; }
+        
+        /* ポップアップによく使われるクラス名やIDを推測して非表示にする */
+        #age-verification, #modal, .modal, .overlay, .popup, #popup, .dialog, #age_check, .age_check {
+            display: none !important;
+            opacity: 0 !important;
+            z-index: -9999 !important;
+            visibility: hidden !important;
+        }
+        
+        /* 画面全体を覆う固定要素（オーバーレイ）をまとめて消す荒技 */
+        div[style*="position: fixed"], div[style*="z-index: 999"], div[style*="z-index: 1000"] {
+            /* 注意：これをやると大切なヘッダーも消える可能性がありますが、本文を読むには有効です */
+            /* display: none !important; */ 
+        }
     """
     soup.head.append(custom_style)
 
-    # 4. タイトル取得（表示用）
     title_text = "タイトルなし"
     if soup.title:
         title_text = soup.title.get_text(strip=True)
 
-    # 5. 整形したHTML全体を文字列にする
-    cleaned_html = str(soup)
-
-    return title_text, cleaned_html
+    return title_text, str(soup)
 
 # ==========================================
 # 画面構成
 # ==========================================
-st.set_page_config(page_title="H-Review Cleaner", layout="centered")
-st.title("🧹 サイトお掃除リーダー")
-st.caption("CSSや色はそのままに、広告やメニューだけ取り除きます。")
+st.set_page_config(page_title="H-Review Unlocker", layout="centered")
+st.title("🔓 年齢認証突破リーダー")
+st.caption("年齢確認ボタンを自動クリック＆ポップアップを強制排除します。")
 
 url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
-if st.button("表示する"):
+if st.button("突破して表示"):
     if not url:
         st.warning("URLを入力してください。")
     else:
         status = st.empty()
         status.text("サイトにアクセス中...")
         
-        html = fetch_html_via_route(url)
+        # 年齢認証突破ロジックを使用
+        html = fetch_html_bypass_age_gate(url)
 
         if html:
-            status.text("不要なデータを掃除中...")
-            title, final_html = clean_html_keep_css(html, url)
+            status.text("ポップアップ除去中...")
+            title, final_html = clean_html_remove_popups(html, url)
             status.empty()
             
             st.success("完了")
             st.subheader(title)
             
-            # iframeで表示（高さは適宜調整してください）
             components.html(final_html, height=800, scrolling=True)
             
         else:
