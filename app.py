@@ -6,7 +6,7 @@ import time
 import subprocess
 
 # ==========================================
-# 設定：入り口URL（ここを踏んでから行く）
+# 設定：入り口URL
 # ==========================================
 FIXED_ENTRY_URL = "https://www.h-ken.net/mypage/20250611_1605697556/"
 
@@ -25,9 +25,9 @@ if "setup_done" not in st.session_state:
         st.session_state.setup_done = True
 
 # ==========================================
-# ブラウザ操作
+# ブラウザ操作（JSでポップアップ破壊）
 # ==========================================
-def fetch_html_via_route(target_url):
+def fetch_html_force_clean(target_url):
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -44,8 +44,32 @@ def fetch_html_via_route(target_url):
 
             # 2. 目的のURLへ
             page.goto(target_url, timeout=30000)
-            page.wait_for_load_state("networkidle")
+            page.wait_for_load_state("domcontentloaded")
+            time.sleep(2) 
 
+            # 3. ポップアップ破壊＆年齢確認クリック
+            page.evaluate("""
+                () => {
+                    const keywords = ['はい', 'YES', 'Yes', '18歳', 'Enter', '入り口', '入場'];
+                    const buttons = document.querySelectorAll('a, button, div, span');
+                    for (let btn of buttons) {
+                        if (keywords.some(k => btn.innerText && btn.innerText.includes(k))) {
+                            btn.click();
+                        }
+                    }
+                    const allDivs = document.querySelectorAll('body > div, body > section');
+                    allDivs.forEach(div => {
+                        const style = window.getComputedStyle(div);
+                        if (style.position === 'fixed' && style.zIndex > 50) {
+                            div.remove();
+                        }
+                    });
+                    document.body.style.overflow = 'visible';
+                    document.body.style.height = 'auto';
+                }
+            """)
+            
+            time.sleep(1) 
             return page.content()
 
         except Exception as e:
@@ -55,92 +79,105 @@ def fetch_html_via_route(target_url):
             browser.close()
 
 # ==========================================
-# 抽出ロジック（外科手術方式）
+# 抽出ロジック（タイトル＋sentenceBox）
 # ==========================================
-def extract_only_content_keep_css(html_content, target_url):
+def extract_target_content(html_content, target_url):
     soup = BeautifulSoup(html_content, 'html.parser')
 
-    # 1. CSS（デザイン）だけは先に確保する
+    # 1. CSS確保
     styles = []
-    # 外部CSSファイル
     for link in soup.find_all('link', rel='stylesheet'):
         styles.append(str(link))
-    # ページ内のCSS
     for style in soup.find_all('style'):
         styles.append(str(style))
-    
     style_html = "\n".join(styles)
 
-    # 2. 本文が入っている「メインの箱」だけを探し出す
-    # （画面全体 soup を使うとポップアップも残るので、中身だけ取り出す）
+    # -------------------------------------------------
+    # 2. タイトルの抽出 (h1 class="pageTitle")
+    # -------------------------------------------------
+    title_html = ""
+    # 指定されたクラスを持つh1を探す
+    target_h1 = soup.find("h1", class_="pageTitle")
     
-    max_score = 0
-    best_html = "<div>本文が見つかりませんでした</div>"
-    
-    # 候補となるタグ（div, section, article, main）
-    candidates = soup.find_all(['div', 'article', 'section', 'main', 'td'])
+    if target_h1:
+        # HTMLごと取得（中のspanタグの色などを残すため）
+        title_html = str(target_h1)
+    else:
+        # なければ普通のh1を探す
+        target_h1 = soup.find("h1")
+        if target_h1:
+            title_html = str(target_h1)
 
-    for candidate in candidates:
-        # スコア計算（文字数が多い場所＝本文の可能性が高い）
-        text = candidate.get_text(strip=True)
-        score = len(text)
-        
-        # リンクだらけの場所（メニュー）は除外
-        links = candidate.find_all('a')
-        link_len = sum([len(a.get_text()) for a in links])
-        
-        if score > 200: # ある程度長いブロックのみ対象
-            if (link_len / score) < 0.5: # リンク文字率が半分以下
-                if score > max_score:
-                    max_score = score
-                    # ここで .decompose() を使って、この候補の中にある邪魔なタグだけ消す
-                    # script（プログラム）は絶対に消す！これがポップアップの正体
-                    for bad in candidate.find_all(["script", "noscript", "iframe", "form", "button", "input"]):
-                        bad.decompose()
-                    
-                    # 候補をHTMLとして保存
-                    best_html = str(candidate)
+    # アプリのヘッダー表示用にテキストだけも取得しておく
+    simple_title_text = soup.title.get_text(strip=True) if soup.title else "抽出結果"
 
-    # 3. 新しいきれいなHTMLを組み立てる
-    # 確保しておいたCSS ＋ 切り抜いた本文 ＝ 完成
+    # -------------------------------------------------
+    # 3. 本文の抽出 (id="sentenceBox")
+    # -------------------------------------------------
+    body_html = "<div>本文が見つかりませんでした</div>"
+    target_div = soup.find(id="sentenceBox")
+
+    # なければ予備のIDを探す
+    if not target_div:
+        target_div = soup.find(id="main_txt")
+
+    if target_div:
+        # 不要なタグ掃除
+        for bad in target_div.find_all(["script", "noscript", "iframe", "form", "button", "input"]):
+            bad.decompose()
+        body_html = str(target_div)
+
+    # -------------------------------------------------
+    # 4. 合体して表示用HTMLを作る
+    # -------------------------------------------------
     final_html = f"""
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="utf-8">
-        <base href="{target_url}"> <!-- CSSのリンク切れ防止 -->
+        <base href="{target_url}">
         {style_html}
         <style>
             body {{
                 background-color: #fff;
-                padding: 10px;
+                padding: 15px;
                 font-family: sans-serif;
-                overflow: auto !important; /* スクロール許可 */
+                overflow: auto !important;
             }}
-            img {{ display: none !important; }} /* 画像は非表示 */
-            /* 念のため固定配置を無効化するCSSも入れておく */
-            div {{ position: static !important; }}
+            /* タイトルを見やすく調整 */
+            h1.pageTitle {{
+                font-size: 20px;
+                margin-bottom: 20px;
+                border-bottom: 1px solid #ccc;
+                padding-bottom: 10px;
+                line-height: 1.4;
+            }}
+            /* 本文の調整 */
+            #sentenceBox {{
+                font-size: 16px;
+                line-height: 1.8;
+                color: #333;
+            }}
+            /* 画像を消す設定（必要ならコメントアウト解除） */
+            /* img {{ display: none !important; }} */
         </style>
     </head>
     <body>
-        {best_html}
+        <!-- ここに抽出したタイトルと本文を並べる -->
+        {title_html}
+        {body_html}
     </body>
     </html>
     """
 
-    # タイトル取得
-    title_text = "タイトルなし"
-    if soup.title:
-        title_text = soup.title.get_text(strip=True)
-
-    return title_text, final_html
+    return simple_title_text, final_html
 
 # ==========================================
 # 画面構成
 # ==========================================
-st.set_page_config(page_title="H-Review Final", layout="centered")
-st.title("💎 コンテンツ抽出リーダー")
-st.caption("ポップアップの外側を切り捨て、中身だけを色付きで表示します。")
+st.set_page_config(page_title="H-Review Master", layout="centered")
+st.title("💎 完全版リーダー")
+st.caption("指定されたタイトルと本文を構造通りに抽出します。")
 
 url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
@@ -151,15 +188,14 @@ if st.button("抽出する"):
         status = st.empty()
         status.text("読み込み中...")
         
-        html = fetch_html_via_route(url)
+        html = fetch_html_force_clean(url)
 
         if html:
-            status.text("本文を切り抜き中...")
-            title, final_html = extract_only_content_keep_css(html, url)
+            status.text("タイトルと本文を結合中...")
+            simple_title, final_html = extract_target_content(html, url)
             status.empty()
             
             st.success("完了")
-            st.subheader(title)
             
             # iframeで表示
             components.html(final_html, height=800, scrolling=True)
