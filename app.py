@@ -6,7 +6,7 @@ import time
 import subprocess
 
 # ==========================================
-# 設定：入り口URL
+# 設定：入り口URL（ここを踏んでから行く）
 # ==========================================
 FIXED_ENTRY_URL = "https://www.h-ken.net/mypage/20250611_1605697556/"
 
@@ -25,9 +25,9 @@ if "setup_done" not in st.session_state:
         st.session_state.setup_done = True
 
 # ==========================================
-# ブラウザ操作（JSでポップアップを破壊する）
+# ブラウザ操作
 # ==========================================
-def fetch_html_force_clean(target_url):
+def fetch_html_via_route(target_url):
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -44,45 +44,8 @@ def fetch_html_force_clean(target_url):
 
             # 2. 目的のURLへ
             page.goto(target_url, timeout=30000)
-            page.wait_for_load_state("domcontentloaded")
-            time.sleep(2) # ポップアップが出るのを少し待つ
+            page.wait_for_load_state("networkidle")
 
-            # 3. 【最強の処理】JavaScriptを実行して、邪魔な要素を内側から破壊する
-            # (画面全体を覆っている position:fixed の要素を全て削除します)
-            page.evaluate("""
-                () => {
-                    // 1. よくある「年齢確認ボタン」があればクリックを試みる
-                    const buttons = document.querySelectorAll('a, button, input[type="button"], div');
-                    const keywords = ['はい', 'YES', 'Yes', '18歳', 'Enter', '入り口', '入場', 'adult'];
-                    for (let btn of buttons) {
-                        if (keywords.some(k => btn.innerText && btn.innerText.includes(k))) {
-                            btn.click(); // 見つけたら即クリック
-                            // break; // 複数あるかもしれないのでbreakしない
-                        }
-                    }
-
-                    // 2. 画面を覆う「邪魔な膜（オーバーレイ）」を強制削除
-                    // z-indexが高く、fixedまたはabsoluteで配置されている要素を狙い撃ち
-                    const allDivs = document.querySelectorAll('body > div, body > section, body > span');
-                    allDivs.forEach(div => {
-                        const style = window.getComputedStyle(div);
-                        // 画面全体を覆っているか、浮いている要素で、中身が少なければ削除対象
-                        if ((style.position === 'fixed' || style.position === 'absolute') && style.zIndex > 100) {
-                            div.remove(); // 削除！
-                        }
-                    });
-
-                    // 3. スクロール禁止（overflow:hidden）を強制解除
-                    document.body.style.overflow = 'visible';
-                    document.body.style.height = 'auto';
-                    document.body.style.position = 'static';
-                    document.documentElement.style.overflow = 'visible';
-                }
-            """)
-            
-            time.sleep(1) # 削除処理の反映待ち
-
-            # 処理後のきれいになったHTMLを返す
             return page.content()
 
         except Exception as e:
@@ -92,60 +55,107 @@ def fetch_html_force_clean(target_url):
             browser.close()
 
 # ==========================================
-# 抽出ロジック（CSS維持）
+# 抽出ロジック（外科手術方式）
 # ==========================================
-def clean_html_keep_css(html_content, target_url):
+def extract_only_content_keep_css(html_content, target_url):
     soup = BeautifulSoup(html_content, 'html.parser')
 
-    # 1. Base URL（CSSリンク切れ防止）
-    if not soup.head:
-        soup.insert(0, soup.new_tag("head"))
+    # 1. CSS（デザイン）だけは先に確保する
+    styles = []
+    # 外部CSSファイル
+    for link in soup.find_all('link', rel='stylesheet'):
+        styles.append(str(link))
+    # ページ内のCSS
+    for style in soup.find_all('style'):
+        styles.append(str(style))
     
-    base_tag = soup.new_tag("base", href=target_url)
-    if soup.head.base:
-        soup.head.base.replace_with(base_tag)
-    else:
-        soup.head.insert(0, base_tag)
+    style_html = "\n".join(styles)
 
-    # 2. 不要タグ削除（ポップアップは既にブラウザ側で消しているので、ここではスクリプト等を消す）
-    garbage_tags = ["script", "noscript", "iframe", "form", "input", "nav", "footer", "header"]
-    for tag_name in garbage_tags:
-        for tag in soup.find_all(tag_name):
-            tag.decompose()
-            
-    # 画像を表示したくない場合はここで消す（今回は残す設定にしてみます。邪魔なら復活させてください）
-    # for img in soup.find_all("img"):
-    #     img.decompose()
+    # 2. 本文が入っている「メインの箱」だけを探し出す
+    # （画面全体 soup を使うとポップアップも残るので、中身だけ取り出す）
+    
+    max_score = 0
+    best_html = "<div>本文が見つかりませんでした</div>"
+    
+    # 候補となるタグ（div, section, article, main）
+    candidates = soup.find_all(['div', 'article', 'section', 'main', 'td'])
 
-    # 3. タイトル取得
+    for candidate in candidates:
+        # スコア計算（文字数が多い場所＝本文の可能性が高い）
+        text = candidate.get_text(strip=True)
+        score = len(text)
+        
+        # リンクだらけの場所（メニュー）は除外
+        links = candidate.find_all('a')
+        link_len = sum([len(a.get_text()) for a in links])
+        
+        if score > 200: # ある程度長いブロックのみ対象
+            if (link_len / score) < 0.5: # リンク文字率が半分以下
+                if score > max_score:
+                    max_score = score
+                    # ここで .decompose() を使って、この候補の中にある邪魔なタグだけ消す
+                    # script（プログラム）は絶対に消す！これがポップアップの正体
+                    for bad in candidate.find_all(["script", "noscript", "iframe", "form", "button", "input"]):
+                        bad.decompose()
+                    
+                    # 候補をHTMLとして保存
+                    best_html = str(candidate)
+
+    # 3. 新しいきれいなHTMLを組み立てる
+    # 確保しておいたCSS ＋ 切り抜いた本文 ＝ 完成
+    final_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <base href="{target_url}"> <!-- CSSのリンク切れ防止 -->
+        {style_html}
+        <style>
+            body {{
+                background-color: #fff;
+                padding: 10px;
+                font-family: sans-serif;
+                overflow: auto !important; /* スクロール許可 */
+            }}
+            img {{ display: none !important; }} /* 画像は非表示 */
+            /* 念のため固定配置を無効化するCSSも入れておく */
+            div {{ position: static !important; }}
+        </style>
+    </head>
+    <body>
+        {best_html}
+    </body>
+    </html>
+    """
+
+    # タイトル取得
     title_text = "タイトルなし"
     if soup.title:
         title_text = soup.title.get_text(strip=True)
 
-    return title_text, str(soup)
+    return title_text, final_html
 
 # ==========================================
 # 画面構成
 # ==========================================
-st.set_page_config(page_title="H-Review Ultra", layout="centered")
-st.title("🔨 ポップアップ破壊リーダー")
-st.caption("邪魔な表示を強制的に削除して中身を表示します。")
+st.set_page_config(page_title="H-Review Final", layout="centered")
+st.title("💎 コンテンツ抽出リーダー")
+st.caption("ポップアップの外側を切り捨て、中身だけを色付きで表示します。")
 
 url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
-if st.button("破壊して読む"):
+if st.button("抽出する"):
     if not url:
         st.warning("URLを入力してください。")
     else:
         status = st.empty()
-        status.text("サイトに侵入中...")
+        status.text("読み込み中...")
         
-        # JS破壊ロジックを実行
-        html = fetch_html_force_clean(url)
+        html = fetch_html_via_route(url)
 
         if html:
-            status.text("整理中...")
-            title, final_html = clean_html_keep_css(html, url)
+            status.text("本文を切り抜き中...")
+            title, final_html = extract_only_content_keep_css(html, url)
             status.empty()
             
             st.success("完了")
