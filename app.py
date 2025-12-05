@@ -1,13 +1,18 @@
 import streamlit as st
+import streamlit.components.v1 as components  # ← これが重要：HTML表示用の部品
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import time
 import subprocess
 
-# --- 設定：入り口となるURL ---
+# ==========================================
+# 設定：入り口となるURL
+# ==========================================
 FIXED_ENTRY_URL = "https://www.h-ken.net/mypage/20250611_1605697556/"
 
-# --- サーバー設定（初回のみ実行） ---
+# ==========================================
+# サーバー設定
+# ==========================================
 def install_playwright():
     try:
         subprocess.run(["playwright", "install", "chromium"], check=True)
@@ -15,18 +20,19 @@ def install_playwright():
         print(f"Install error: {e}")
 
 if "setup_done" not in st.session_state:
-    with st.spinner("サーバー起動中...（初回は時間がかかります）"):
+    with st.spinner("サーバー起動中..."):
         install_playwright()
         st.session_state.setup_done = True
 
-# --- ブラウザ操作 ---
+# ==========================================
+# ブラウザ操作
+# ==========================================
 def fetch_html_via_route(target_url):
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
             args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
         )
-        # iPhone 12設定
         iphone_12 = p.devices['iPhone 12']
         context = browser.new_context(**iphone_12)
         page = context.new_page()
@@ -48,11 +54,13 @@ def fetch_html_via_route(target_url):
         finally:
             browser.close()
 
-# --- 抽出ロジック（色付き） ---
+# ==========================================
+# 抽出ロジック（色付き重視）
+# ==========================================
 def extract_colored_body(html_content):
     soup = BeautifulSoup(html_content, 'html.parser')
 
-    # 不要なタグ削除（色は残す）
+    # 不要なタグ削除（色は残すため、fontやspanは消さない）
     for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "iframe", "form", "button", "input", "meta", "link", "img", "svg"]):
         tag.decompose()
 
@@ -66,7 +74,8 @@ def extract_colored_body(html_content):
 
     # 本文（HTML保持）
     max_score = 0
-    best_html = "<p>本文が見つかりませんでした</p>"
+    best_html = "<div>本文が見つかりませんでした</div>"
+    
     candidates = soup.find_all(['div', 'article', 'section', 'main'])
 
     for candidate in candidates:
@@ -81,14 +90,17 @@ def extract_colored_body(html_content):
 
         if score > max_score:
             max_score = score
+            # ここでHTMLタグごと取得する
             best_html = str(candidate)
 
     return title_text, best_html
 
-# --- 画面構成 ---
+# ==========================================
+# 画面構成
+# ==========================================
 st.set_page_config(page_title="Review Extractor", layout="centered")
-st.title("📱 体験談抽出アプリ")
-st.caption("指定の入り口URLを経由して内容を表示します。")
+st.title("🌈 完全色付き抽出アプリ")
+st.caption("サイトのデザイン（色・太字）をそのまま表示します。")
 
 url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
@@ -102,12 +114,35 @@ if st.button("抽出開始"):
         html = fetch_html_via_route(url)
 
         if html:
-            title, body = extract_colored_body(html)
+            title, body_html = extract_colored_body(html)
             status.empty()
+            
             st.success("完了")
-            st.markdown(f"### {title}")
+            st.subheader(title)
             st.divider()
-            st.markdown(body, unsafe_allow_html=True)
+            
+            # 【ここが変更点】
+            # HTMLを見やすくするためのCSSを追加して、iframeの中に表示します
+            custom_css = """
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                    line-height: 1.6;
+                    color: #333;
+                    background-color: #fff;
+                    padding: 10px;
+                }
+                /* 強調色の補正 */
+                .red, .danger, .marker { color: red !important; font-weight: bold; }
+            </style>
+            """
+            
+            # 抽出したHTMLにCSSをくっつける
+            final_html = custom_css + body_html
+            
+            # iframeとして表示（これで色が守られます）
+            components.html(final_html, height=600, scrolling=True)
+            
             st.divider()
         else:
             status.error("失敗しました。")
