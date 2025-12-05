@@ -55,116 +55,92 @@ def fetch_html_via_route(target_url):
             browser.close()
 
 # ==========================================
-# 抽出ロジック（CSSリンク完全保持版）
+# 抽出ロジック（引き算方式）
 # ==========================================
-def extract_with_css(html_content, target_url):
+def clean_html_keep_css(html_content, target_url):
     soup = BeautifulSoup(html_content, 'html.parser')
 
-    # 1. デザインに関わるタグ（link, style）をすべて抽出して保存しておく
-    # これがないと class="conversation" の色が分かりません
-    head_styles = []
+    # 1. <base>タグを追加して、CSSや画像のリンク切れを防ぐ
+    # 既存のheadを取得、なければ作る
+    if not soup.head:
+        new_head = soup.new_tag("head")
+        soup.insert(0, new_head)
     
-    # 外部CSSファイルへのリンクを取得
-    for link in soup.find_all('link', rel='stylesheet'):
-        head_styles.append(str(link))
-        
-    # ページ内に直接書かれたスタイルを取得
-    for style in soup.find_all('style'):
-        head_styles.append(str(style))
-        
-    # スタイル群を結合
-    styles_html = "\n".join(head_styles)
+    # baseタグをheadの先頭に追加
+    base_tag = soup.new_tag("base", href=target_url)
+    if soup.head.base:
+        soup.head.base.replace_with(base_tag)
+    else:
+        soup.head.insert(0, base_tag)
 
-    # 2. 不要な要素の削除（scriptなどは消すが、デザイン系は残す）
-    for tag in soup(["script", "noscript", "iframe", "form", "button", "input", "img", "svg"]):
-        tag.decompose()
+    # 2. 明らかに不要なタグだけをピンポイントで削除（引き算）
+    # 本文が含まれる可能性がある div や table は消さない！
+    garbage_tags = [
+        "script",     # プログラム
+        "noscript",   # プログラムなし用表示
+        "iframe",     # 外部埋め込み（広告など）
+        "form",       # 入力フォーム
+        "button",     # ボタン
+        "input",      # 入力欄
+        "nav",        # ナビゲーションメニュー
+        "footer",     # フッター（著作権表示など）
+        "header",     # ヘッダー（ロゴなど）
+    ]
+    
+    for tag_name in garbage_tags:
+        for tag in soup.find_all(tag_name):
+            tag.decompose()
 
-    # 3. タイトル取得
+    # 3. 画像を表示するかどうか（今回は「文字だけ見たい」要望に合わせて非表示にするCSSを追加）
+    # 画像も見たければ、以下の style タグの img 部分を消してください
+    custom_style = soup.new_tag("style")
+    custom_style.string = """
+        body { background-color: #fff !important; font-family: sans-serif; }
+        /* 画像を非表示にする（レイアウト崩れ防止のため display:none 推奨） */
+        img { display: none !important; }
+        /* 画面幅をスマホっぽく調整 */
+        .wrapper, #wrapper, .container { width: 100% !important; max-width: 100% !important; }
+    """
+    soup.head.append(custom_style)
+
+    # 4. タイトル取得（表示用）
     title_text = "タイトルなし"
-    h1 = soup.find('h1')
-    if h1:
-        title_text = h1.get_text(strip=True)
-    elif soup.title:
+    if soup.title:
         title_text = soup.title.get_text(strip=True)
 
-    # 4. 本文抽出
-    max_score = 0
-    best_body_html = "<div>本文が見つかりませんでした</div>"
-    
-    candidates = soup.find_all(['div', 'article', 'section', 'main'])
+    # 5. 整形したHTML全体を文字列にする
+    cleaned_html = str(soup)
 
-    for candidate in candidates:
-        text = candidate.get_text(strip=True)
-        score = len(text)
-        
-        # リンク文字率が高いブロック（メニュー等）を除外
-        links = candidate.find_all('a')
-        link_len = sum([len(a.get_text()) for a in links])
-        if score > 0 and (link_len / score) > 0.5:
-            continue
-
-        if score > max_score:
-            max_score = score
-            best_body_html = str(candidate)
-
-    # 5. 最終的なHTMLを組み立てる
-    # ここが重要： <base href="..."> を入れることで、相対パスのCSSを読み込めるようにする
-    final_html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <base href="{target_url}"> <!-- これで外部CSSファイルが読み込まれます -->
-        {styles_html} <!-- 元サイトのデザインルールを注入 -->
-        <style>
-            body {{
-                background-color: #fff;
-                padding: 20px;
-                font-family: sans-serif;
-            }}
-            /* 画像を消した跡地が崩れないように調整 */
-            img {{ display: none !important; }}
-        </style>
-    </head>
-    <body>
-        {best_body_html}
-    </body>
-    </html>
-    """
-
-    return title_text, final_html
+    return title_text, cleaned_html
 
 # ==========================================
 # 画面構成
 # ==========================================
-st.set_page_config(page_title="H-Review Pro", layout="centered")
-st.title("🌈 デザイン完全再現アプリ")
-st.caption("CSSクラス（conversation等）も反映して表示します。")
+st.set_page_config(page_title="H-Review Cleaner", layout="centered")
+st.title("🧹 サイトお掃除リーダー")
+st.caption("CSSや色はそのままに、広告やメニューだけ取り除きます。")
 
 url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
-if st.button("抽出開始"):
+if st.button("表示する"):
     if not url:
         st.warning("URLを入力してください。")
     else:
         status = st.empty()
-        status.text("読み込み中...")
+        status.text("サイトにアクセス中...")
         
         html = fetch_html_via_route(url)
 
         if html:
-            # URLも渡す（Base URL設定のため）
-            title, final_html = extract_with_css(html, url)
-            
+            status.text("不要なデータを掃除中...")
+            title, final_html = clean_html_keep_css(html, url)
             status.empty()
             
             st.success("完了")
             st.subheader(title)
-            st.divider()
             
-            # iframeで表示（外部CSSを読み込ませるため）
+            # iframeで表示（高さは適宜調整してください）
             components.html(final_html, height=800, scrolling=True)
             
-            st.divider()
         else:
-            status.error("失敗しました。")
+            status.error("読み込みに失敗しました。")
