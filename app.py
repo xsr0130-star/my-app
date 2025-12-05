@@ -6,7 +6,7 @@ import time
 import subprocess
 
 # ==========================================
-# 設定：入り口となるURL
+# 設定：入り口URL
 # ==========================================
 FIXED_ENTRY_URL = "https://www.h-ken.net/mypage/20250611_1605697556/"
 
@@ -25,9 +25,9 @@ if "setup_done" not in st.session_state:
         st.session_state.setup_done = True
 
 # ==========================================
-# ブラウザ操作（年齢確認ボタンをクリックする処理を追加）
+# ブラウザ操作（JSでポップアップを破壊する）
 # ==========================================
-def fetch_html_bypass_age_gate(target_url):
+def fetch_html_force_clean(target_url):
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -44,24 +44,45 @@ def fetch_html_bypass_age_gate(target_url):
 
             # 2. 目的のURLへ
             page.goto(target_url, timeout=30000)
-            page.wait_for_load_state("domcontentloaded") # 読み込み待ち
+            page.wait_for_load_state("domcontentloaded")
+            time.sleep(2) # ポップアップが出るのを少し待つ
 
-            # === 【追加】年齢確認ボタンを探して押す ===
-            # よくあるボタンの言葉をリストアップして、見つけたらクリックする
-            age_keywords = ["はい", "Yes", "YES", "Enter", "18歳以上", "Entry", "入場", "承諾"]
+            # 3. 【最強の処理】JavaScriptを実行して、邪魔な要素を内側から破壊する
+            # (画面全体を覆っている position:fixed の要素を全て削除します)
+            page.evaluate("""
+                () => {
+                    // 1. よくある「年齢確認ボタン」があればクリックを試みる
+                    const buttons = document.querySelectorAll('a, button, input[type="button"], div');
+                    const keywords = ['はい', 'YES', 'Yes', '18歳', 'Enter', '入り口', '入場', 'adult'];
+                    for (let btn of buttons) {
+                        if (keywords.some(k => btn.innerText && btn.innerText.includes(k))) {
+                            btn.click(); // 見つけたら即クリック
+                            // break; // 複数あるかもしれないのでbreakしない
+                        }
+                    }
+
+                    // 2. 画面を覆う「邪魔な膜（オーバーレイ）」を強制削除
+                    // z-indexが高く、fixedまたはabsoluteで配置されている要素を狙い撃ち
+                    const allDivs = document.querySelectorAll('body > div, body > section, body > span');
+                    allDivs.forEach(div => {
+                        const style = window.getComputedStyle(div);
+                        // 画面全体を覆っているか、浮いている要素で、中身が少なければ削除対象
+                        if ((style.position === 'fixed' || style.position === 'absolute') && style.zIndex > 100) {
+                            div.remove(); // 削除！
+                        }
+                    });
+
+                    // 3. スクロール禁止（overflow:hidden）を強制解除
+                    document.body.style.overflow = 'visible';
+                    document.body.style.height = 'auto';
+                    document.body.style.position = 'static';
+                    document.documentElement.style.overflow = 'visible';
+                }
+            """)
             
-            for word in age_keywords:
-                try:
-                    # 画面内にその言葉を含むボタンやリンクがあればクリック（タイムアウト短め）
-                    # 見つからなければエラーになるので無視して次へ
-                    page.get_by_text(word).first.click(timeout=500)
-                    print(f"Clicked: {word}")
-                    time.sleep(1) # クリック後の画面遷移待ち
-                    break # 1つ押せたら終了
-                except:
-                    continue
-            
-            # 3. 最終的なHTMLを取得
+            time.sleep(1) # 削除処理の反映待ち
+
+            # 処理後のきれいになったHTMLを返す
             return page.content()
 
         except Exception as e:
@@ -71,12 +92,12 @@ def fetch_html_bypass_age_gate(target_url):
             browser.close()
 
 # ==========================================
-# 抽出ロジック（CSS維持 ＋ ポップアップ強制削除）
+# 抽出ロジック（CSS維持）
 # ==========================================
-def clean_html_remove_popups(html_content, target_url):
+def clean_html_keep_css(html_content, target_url):
     soup = BeautifulSoup(html_content, 'html.parser')
 
-    # 1. Base URL設定
+    # 1. Base URL（CSSリンク切れ防止）
     if not soup.head:
         soup.insert(0, soup.new_tag("head"))
     
@@ -86,41 +107,17 @@ def clean_html_remove_popups(html_content, target_url):
     else:
         soup.head.insert(0, base_tag)
 
-    # 2. 不要タグ削除（imgは残すか消すか選べます。今回は消す設定）
-    garbage_tags = ["script", "noscript", "iframe", "form", "button", "input", "nav", "footer", "header"]
+    # 2. 不要タグ削除（ポップアップは既にブラウザ側で消しているので、ここではスクリプト等を消す）
+    garbage_tags = ["script", "noscript", "iframe", "form", "input", "nav", "footer", "header"]
     for tag_name in garbage_tags:
         for tag in soup.find_all(tag_name):
             tag.decompose()
+            
+    # 画像を表示したくない場合はここで消す（今回は残す設定にしてみます。邪魔なら復活させてください）
+    # for img in soup.find_all("img"):
+    #     img.decompose()
 
-    # 3. 【強力】ポップアップを強制的に消すCSSを注入
-    # どんなIDかわからないため、「画面全体を覆う系」のCSSプロパティを無効化し、
-    # スクロール禁止(overflow: hidden)を解除する
-    custom_style = soup.new_tag("style")
-    custom_style.string = """
-        body { 
-            background-color: #fff !important; 
-            font-family: sans-serif; 
-            overflow: auto !important; /* スクロール禁止を強制解除 */
-            height: auto !important;
-        }
-        img { display: none !important; }
-        
-        /* ポップアップによく使われるクラス名やIDを推測して非表示にする */
-        #age-verification, #modal, .modal, .overlay, .popup, #popup, .dialog, #age_check, .age_check {
-            display: none !important;
-            opacity: 0 !important;
-            z-index: -9999 !important;
-            visibility: hidden !important;
-        }
-        
-        /* 画面全体を覆う固定要素（オーバーレイ）をまとめて消す荒技 */
-        div[style*="position: fixed"], div[style*="z-index: 999"], div[style*="z-index: 1000"] {
-            /* 注意：これをやると大切なヘッダーも消える可能性がありますが、本文を読むには有効です */
-            /* display: none !important; */ 
-        }
-    """
-    soup.head.append(custom_style)
-
+    # 3. タイトル取得
     title_text = "タイトルなし"
     if soup.title:
         title_text = soup.title.get_text(strip=True)
@@ -130,30 +127,31 @@ def clean_html_remove_popups(html_content, target_url):
 # ==========================================
 # 画面構成
 # ==========================================
-st.set_page_config(page_title="H-Review Unlocker", layout="centered")
-st.title("🔓 年齢認証突破リーダー")
-st.caption("年齢確認ボタンを自動クリック＆ポップアップを強制排除します。")
+st.set_page_config(page_title="H-Review Ultra", layout="centered")
+st.title("🔨 ポップアップ破壊リーダー")
+st.caption("邪魔な表示を強制的に削除して中身を表示します。")
 
 url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
-if st.button("突破して表示"):
+if st.button("破壊して読む"):
     if not url:
         st.warning("URLを入力してください。")
     else:
         status = st.empty()
-        status.text("サイトにアクセス中...")
+        status.text("サイトに侵入中...")
         
-        # 年齢認証突破ロジックを使用
-        html = fetch_html_bypass_age_gate(url)
+        # JS破壊ロジックを実行
+        html = fetch_html_force_clean(url)
 
         if html:
-            status.text("ポップアップ除去中...")
-            title, final_html = clean_html_remove_popups(html, url)
+            status.text("整理中...")
+            title, final_html = clean_html_keep_css(html, url)
             status.empty()
             
             st.success("完了")
             st.subheader(title)
             
+            # iframeで表示
             components.html(final_html, height=800, scrolling=True)
             
         else:
