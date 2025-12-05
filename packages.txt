@@ -1,4 +1,2 @@
-```text
 chromium
 chromium-driver
-```
