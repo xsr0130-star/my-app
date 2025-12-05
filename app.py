@@ -12,7 +12,7 @@ from io import BytesIO
 from docx import Document
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont, TTFError
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
@@ -39,26 +39,31 @@ if "setup_done" not in st.session_state:
         st.session_state.setup_done = True
 
 # ==========================================
-# 【修正】日本語フォント確保（自己修復機能付き）
+# 【重要】日本語フォント確保（厳密なチェック付き）
 # ==========================================
-def ensure_japanese_font():
+def get_valid_japanese_font():
     font_filename = "IPAexGothic.ttf"
-    # より安定したURLに変更（GitHubのRawデータ）
+    # 安定したGitHubのRaw URL
     font_url = "https://raw.githubusercontent.com/minoryorg/ipaex-font/master/ipaexg.ttf"
     
-    # 1. 壊れたファイルが残っていたら削除するチェック
+    # 1. 既存ファイルのチェック（壊れていたら消す）
     if os.path.exists(font_filename):
-        # サイズが小さすぎる(1MB以下)場合は、失敗したゴミファイルとみなして消す
-        if os.path.getsize(font_filename) < 1000 * 1000:
+        # フォントファイルは約4MB以上あるはず。2MB以下なら壊れているとみなす
+        if os.path.getsize(font_filename) < 2 * 1024 * 1024:
             os.remove(font_filename)
 
-    # 2. ファイルがなければダウンロード
+    # 2. ダウンロード（ファイルがない場合）
     if not os.path.exists(font_filename):
         try:
-            response = requests.get(font_url, timeout=30)
+            response = requests.get(font_url, timeout=60)
             if response.status_code == 200:
                 with open(font_filename, "wb") as f:
                     f.write(response.content)
+                
+                # ダウンロード直後にもサイズチェック
+                if os.path.getsize(font_filename) < 2 * 1024 * 1024:
+                    os.remove(font_filename) # 失敗したので消す
+                    return None
             else:
                 return None
         except Exception:
@@ -91,25 +96,25 @@ def create_pdf(title, clean_text_list):
                             rightMargin=20*mm, leftMargin=20*mm,
                             topMargin=20*mm, bottomMargin=20*mm)
     
-    # フォント読み込み（失敗時は英語フォントへ逃げる）
-    font_path = ensure_japanese_font()
-    font_name = 'Helvetica' # デフォルト
+    # フォント準備
+    font_path = get_valid_japanese_font()
     
+    # フォントが確保できた場合のみ登録
     if font_path:
         try:
             pdfmetrics.registerFont(TTFont('Japanese', font_path))
             font_name = 'Japanese'
-        except TTFError:
-            # 万が一フォントが壊れていたら削除して次回に備える
-            if os.path.exists(font_path):
-                os.remove(font_path)
-            # 今回は英語フォントで進める（エラーで止まるよりはマシ）
-            pass
+        except Exception:
+            # 登録に失敗したら英語フォント（文字化けするがエラーで落ちないようにする）
+            font_name = 'Helvetica'
+    else:
+        # ダウンロード失敗時
+        font_name = 'Helvetica'
 
     styles = getSampleStyleSheet()
     
-    # スタイル定義
-    style_body = ParagraphStyle(name='Body',
+    # 日本語対応スタイル
+    style_body = ParagraphStyle(name='JapaneseBody',
                                 parent=styles['Normal'],
                                 fontName=font_name,
                                 fontSize=10.5,
@@ -117,7 +122,7 @@ def create_pdf(title, clean_text_list):
                                 spaceAfter=6,
                                 alignment=TA_JUSTIFY)
                                 
-    style_title = ParagraphStyle(name='Title',
+    style_title = ParagraphStyle(name='JapaneseTitle',
                                  parent=styles['Heading1'],
                                  fontName=font_name,
                                  fontSize=16,
@@ -126,9 +131,10 @@ def create_pdf(title, clean_text_list):
 
     story = []
     
-    # PDF生成
+    # タイトル
     story.append(Paragraph(title, style_title))
     
+    # 本文
     for text in clean_text_list:
         if text.strip():
             # 特殊文字エスケープ
@@ -136,12 +142,15 @@ def create_pdf(title, clean_text_list):
             story.append(Paragraph(safe_text, style_body))
             story.append(Spacer(1, 2*mm))
 
-    doc.build(story)
-    buffer.seek(0)
-    return buffer
+    try:
+        doc.build(story)
+        buffer.seek(0)
+        return buffer, True # 成功フラグ
+    except Exception:
+        return None, False
 
 # ==========================================
-# ブラウザ操作
+# ブラウザ操作（JSでポップアップ破壊）
 # ==========================================
 def fetch_html_force_clean(target_url):
     with sync_playwright() as p:
@@ -283,52 +292,63 @@ def extract_target_content(html_content, target_url):
 # ==========================================
 # 画面構成
 # ==========================================
-st.set_page_config(page_title="H-Review Pro", layout="wide")
+st.set_page_config(page_title="H-Review Pro", layout="centered")
 
-st.title("💎 完全版リーダー (修復機能付き)")
-st.caption("抽出・表示・Word/PDF保存が可能です。")
+st.title("💎 コンテンツ抽出アプリ")
+st.caption("抽出後、下のボタンから保存できます。")
 
-col1, col2 = st.columns([3, 1])
-with col1:
-    url = st.text_input("読みたい記事のURL", placeholder="https://...")
+url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
-if st.button("抽出する", type="primary"):
+# 全幅ボタン
+if st.button("抽出を開始する", type="primary", use_container_width=True):
     if not url:
         st.warning("URLを入力してください。")
     else:
         status = st.empty()
-        status.text("読み込み中...")
+        status.info("⏳ サイトを解析中... (10〜20秒かかります)")
         
         html = fetch_html_force_clean(url)
 
         if html:
-            status.text("データ生成中...")
+            status.info("📄 データ生成中...")
             
             page_title, article_title, text_list, final_html = extract_target_content(html, url)
             
+            # --- 処理完了 ---
             status.empty()
-            st.success("完了")
+            st.success("抽出完了！")
             
-            st.sidebar.markdown("### 📥 ダウンロード")
+            # === 保存ボタンエリア (メイン画面・横並び) ===
+            col1, col2 = st.columns(2)
             
-            # Word
-            docx_file = create_docx(article_title, text_list)
-            st.sidebar.download_button(
-                label="📄 Word (.docx) で保存",
-                data=docx_file,
-                file_name="story.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
+            with col1:
+                # Word
+                docx_file = create_docx(article_title, text_list)
+                st.download_button(
+                    label="📄 Wordで保存",
+                    data=docx_file,
+                    file_name="story.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True # スマホで見やすく幅一杯に
+                )
             
-            # PDF
-            pdf_file = create_pdf(article_title, text_list)
-            st.sidebar.download_button(
-                label="📕 PDF (.pdf) で保存",
-                data=pdf_file,
-                file_name="story.pdf",
-                mime="application/pdf"
-            )
-
+            with col2:
+                # PDF
+                pdf_file, pdf_success = create_pdf(article_title, text_list)
+                if pdf_success:
+                    st.download_button(
+                        label="📕 PDFで保存",
+                        data=pdf_file,
+                        file_name="story.pdf",
+                        mime="application/pdf",
+                        use_container_width=True # スマホで見やすく幅一杯に
+                    )
+                else:
+                    st.error("PDF用フォントエラー")
+            
+            st.divider()
+            
+            # プレビュー表示
             components.html(final_html, height=800, scrolling=True)
             
         else:
