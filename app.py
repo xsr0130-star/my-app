@@ -8,11 +8,11 @@ import os
 import requests
 from io import BytesIO
 
-# Word/PDF作成用ライブラリ
+# Word/PDF作成用
 from docx import Document
 from reportlab.pdfgen import canvas
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfbase.ttfonts import TTFont, TTFError
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
@@ -39,24 +39,35 @@ if "setup_done" not in st.session_state:
         st.session_state.setup_done = True
 
 # ==========================================
-# 便利関数：日本語フォントの確保（PDF用）
+# 【修正】日本語フォント確保（自己修復機能付き）
 # ==========================================
 def ensure_japanese_font():
-    """PDF作成用にIPAexゴシックフォントをダウンロードする"""
-    font_path = "IPAexGothic.ttf"
-    if not os.path.exists(font_path):
-        # 安定したIPAフォントの配布先（GitHub等のミラー）から取得
-        url = "https://github.com/minoryorg/ipaex-font/raw/refs/heads/master/ipaexg.ttf"
+    font_filename = "IPAexGothic.ttf"
+    # より安定したURLに変更（GitHubのRawデータ）
+    font_url = "https://raw.githubusercontent.com/minoryorg/ipaex-font/master/ipaexg.ttf"
+    
+    # 1. 壊れたファイルが残っていたら削除するチェック
+    if os.path.exists(font_filename):
+        # サイズが小さすぎる(1MB以下)場合は、失敗したゴミファイルとみなして消す
+        if os.path.getsize(font_filename) < 1000 * 1000:
+            os.remove(font_filename)
+
+    # 2. ファイルがなければダウンロード
+    if not os.path.exists(font_filename):
         try:
-            response = requests.get(url)
-            with open(font_path, "wb") as f:
-                f.write(response.content)
-        except:
-            pass
-    return font_path
+            response = requests.get(font_url, timeout=30)
+            if response.status_code == 200:
+                with open(font_filename, "wb") as f:
+                    f.write(response.content)
+            else:
+                return None
+        except Exception:
+            return None
+            
+    return font_filename if os.path.exists(font_filename) else None
 
 # ==========================================
-# Wordファイル作成関数
+# Wordファイル作成
 # ==========================================
 def create_docx(title, clean_text_list):
     doc = Document()
@@ -72,7 +83,7 @@ def create_docx(title, clean_text_list):
     return buffer
 
 # ==========================================
-# PDFファイル作成関数（テキストベース）
+# PDFファイル作成
 # ==========================================
 def create_pdf(title, clean_text_list):
     buffer = BytesIO()
@@ -80,26 +91,33 @@ def create_pdf(title, clean_text_list):
                             rightMargin=20*mm, leftMargin=20*mm,
                             topMargin=20*mm, bottomMargin=20*mm)
     
-    # 日本語フォント登録
+    # フォント読み込み（失敗時は英語フォントへ逃げる）
     font_path = ensure_japanese_font()
-    if os.path.exists(font_path):
-        pdfmetrics.registerFont(TTFont('Japanese', font_path))
-        font_name = 'Japanese'
-    else:
-        font_name = 'Helvetica' # フォールバック（文字化けする可能性あり）
+    font_name = 'Helvetica' # デフォルト
+    
+    if font_path:
+        try:
+            pdfmetrics.registerFont(TTFont('Japanese', font_path))
+            font_name = 'Japanese'
+        except TTFError:
+            # 万が一フォントが壊れていたら削除して次回に備える
+            if os.path.exists(font_path):
+                os.remove(font_path)
+            # 今回は英語フォントで進める（エラーで止まるよりはマシ）
+            pass
 
     styles = getSampleStyleSheet()
     
-    # 日本語用スタイル定義
-    style_body = ParagraphStyle(name='JapaneseBody',
+    # スタイル定義
+    style_body = ParagraphStyle(name='Body',
                                 parent=styles['Normal'],
                                 fontName=font_name,
                                 fontSize=10.5,
-                                leading=16, # 行間
+                                leading=16,
                                 spaceAfter=6,
                                 alignment=TA_JUSTIFY)
                                 
-    style_title = ParagraphStyle(name='JapaneseTitle',
+    style_title = ParagraphStyle(name='Title',
                                  parent=styles['Heading1'],
                                  fontName=font_name,
                                  fontSize=16,
@@ -108,13 +126,12 @@ def create_pdf(title, clean_text_list):
 
     story = []
     
-    # タイトル追加
+    # PDF生成
     story.append(Paragraph(title, style_title))
     
-    # 本文追加
     for text in clean_text_list:
         if text.strip():
-            # PDF生成時にエラーになる特殊文字をエスケープ
+            # 特殊文字エスケープ
             safe_text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             story.append(Paragraph(safe_text, style_body))
             story.append(Spacer(1, 2*mm))
@@ -173,12 +190,11 @@ def fetch_html_force_clean(target_url):
             browser.close()
 
 # ==========================================
-# 抽出ロジック（HTML表示用 ＆ ファイル保存用データ作成）
+# 抽出ロジック
 # ==========================================
 def extract_target_content(html_content, target_url):
     soup = BeautifulSoup(html_content, 'html.parser')
 
-    # CSS確保
     styles = []
     for link in soup.find_all('link', rel='stylesheet'):
         styles.append(str(link))
@@ -186,7 +202,7 @@ def extract_target_content(html_content, target_url):
         styles.append(str(style))
     style_html = "\n".join(styles)
 
-    # タイトル抽出
+    # タイトル
     title_html = ""
     title_text_clean = "タイトルなし"
     target_h1 = soup.find("h1", class_="pageTitle")
@@ -202,37 +218,31 @@ def extract_target_content(html_content, target_url):
 
     simple_title_text = soup.title.get_text(strip=True) if soup.title else "抽出結果"
 
-    # 本文抽出
+    # 本文
     body_html = "<div>本文が見つかりませんでした</div>"
-    text_list_for_file = [] # Word/PDF保存用のテキストリスト
+    text_list_for_file = []
     
     target_div = soup.find(id="sentenceBox")
     if not target_div:
         target_div = soup.find(id="main_txt")
 
     if target_div:
-        # ゴミ掃除
         for bad in target_div.find_all(["script", "noscript", "iframe", "form", "button", "input"]):
             bad.decompose()
 
-        # 不要ブロック（kakomiPop2以降）のカット
         cut_point = target_div.find(class_="kakomiPop2")
         if cut_point:
             for sibling in cut_point.find_next_siblings():
                 sibling.decompose()
             cut_point.decompose()
 
-        # HTML保存
         body_html = str(target_div)
         
-        # Word/PDF用のテキストデータを抽出（改行を意識）
-        # pタグやdivタグごとにテキストを取得
         for elem in target_div.find_all(['p', 'div', 'h2', 'h3', 'br']):
             txt = elem.get_text(strip=True)
             if txt:
                 text_list_for_file.append(txt)
 
-    # 表示用HTML
     final_html = f"""
     <!DOCTYPE html>
     <html>
@@ -273,14 +283,12 @@ def extract_target_content(html_content, target_url):
 # ==========================================
 # 画面構成
 # ==========================================
-st.set_page_config(page_title="H-Review Pro", layout="wide") # 画面を広く使う
+st.set_page_config(page_title="H-Review Pro", layout="wide")
 
-st.title("💎 完全版リーダー (保存機能付き)")
+st.title("💎 完全版リーダー (修復機能付き)")
 st.caption("抽出・表示・Word/PDF保存が可能です。")
 
-# レイアウト：左に入力、右にボタン
 col1, col2 = st.columns([3, 1])
-
 with col1:
     url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
@@ -296,17 +304,14 @@ if st.button("抽出する", type="primary"):
         if html:
             status.text("データ生成中...")
             
-            # 抽出処理
-            # 返り値が増えました: (タブタイトル, 記事タイトル, 本文リスト, 表示用HTML)
             page_title, article_title, text_list, final_html = extract_target_content(html, url)
             
             status.empty()
             st.success("完了")
             
-            # --- 保存ボタンエリア (サイドバーに設置) ---
             st.sidebar.markdown("### 📥 ダウンロード")
             
-            # 1. Wordボタン
+            # Word
             docx_file = create_docx(article_title, text_list)
             st.sidebar.download_button(
                 label="📄 Word (.docx) で保存",
@@ -315,7 +320,7 @@ if st.button("抽出する", type="primary"):
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             )
             
-            # 2. PDFボタン
+            # PDF
             pdf_file = create_pdf(article_title, text_list)
             st.sidebar.download_button(
                 label="📕 PDF (.pdf) で保存",
@@ -324,7 +329,6 @@ if st.button("抽出する", type="primary"):
                 mime="application/pdf"
             )
 
-            # --- メイン画面表示 ---
             components.html(final_html, height=800, scrolling=True)
             
         else:
