@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
@@ -112,4 +111,3 @@ if st.button("抽出開始"):
             st.divider()
         else:
             status.error("失敗しました。")
-```
