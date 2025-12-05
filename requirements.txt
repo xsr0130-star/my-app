@@ -1,5 +1,3 @@
-```text
 streamlit
 playwright
 beautifulsoup4
-```
