@@ -1,23 +1,17 @@
 import streamlit as st
 import streamlit.components.v1 as components
 from playwright.sync_api import sync_playwright
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 import time
 import subprocess
 import os
-import requests
+import re
 from io import BytesIO
 
-# Word/PDF作成用
+# Word作成用
 from docx import Document
-from reportlab.pdfgen import canvas
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_JUSTIFY
+from docx.shared import RGBColor, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 # ==========================================
 # 設定：入り口URL
@@ -39,120 +33,141 @@ if "setup_done" not in st.session_state:
         st.session_state.setup_done = True
 
 # ==========================================
-# 【修正】日本語フォント確保（Google Fonts利用）
+# 【新機能】HTMLの色をWordの色に変換するロジック
 # ==========================================
-def get_valid_japanese_font():
-    # 以前の壊れたファイルがあれば削除する（クリーンアップ）
-    old_font = "IPAexGothic.ttf"
-    if os.path.exists(old_font):
-        os.remove(old_font)
-
-    font_filename = "NotoSansJP-Regular.ttf"
-    # Google Fontsの公式Rawデータ（安定・高速）
-    font_url = "https://github.com/google/fonts/raw/main/ofl/notosansjp/NotoSansJP-Regular.ttf"
-    
-    # ファイルがない、またはサイズがおかしい場合は再ダウンロード
-    if not os.path.exists(font_filename) or os.path.getsize(font_filename) < 1000:
-        try:
-            # 以前の残骸を消す
-            if os.path.exists(font_filename):
-                os.remove(font_filename)
-                
-            response = requests.get(font_url, timeout=30)
-            if response.status_code == 200:
-                with open(font_filename, "wb") as f:
-                    f.write(response.content)
-            else:
-                return None
-        except Exception:
-            return None
-            
-    # 最終チェック：ファイルが存在し、サイズが十分か
-    if os.path.exists(font_filename) and os.path.getsize(font_filename) > 1000000:
-        return font_filename
-    else:
+def parse_color(style_str):
+    """style属性やcolor属性からRGB値を返す"""
+    if not style_str:
         return None
+    
+    # 1. Hexコード (#FF0000) を探す
+    hex_match = re.search(r'#([0-9a-fA-F]{6})', style_str)
+    if hex_match:
+        hex_code = hex_match.group(1)
+        return RGBColor(int(hex_code[:2], 16), int(hex_code[2:4], 16), int(hex_code[4:], 16))
+    
+    # 2. 一般的な色名を探す（h-kenでよく使われる色）
+    style_lower = style_str.lower()
+    colors = {
+        'red': RGBColor(255, 0, 0),
+        'blue': RGBColor(0, 0, 255),
+        'green': RGBColor(0, 128, 0),
+        'lightseagreen': RGBColor(32, 178, 170), # タイトルによくある色
+        'pink': RGBColor(255, 192, 203),
+        'orange': RGBColor(255, 165, 0),
+        'purple': RGBColor(128, 0, 128),
+        'gray': RGBColor(128, 128, 128),
+        'grey': RGBColor(128, 128, 128),
+        'bold': None # 色ではないがスタイルにある場合
+    }
+    
+    for name, rgb in colors.items():
+        if name in style_lower:
+            return rgb
+            
+    return None
+
+def apply_html_style_to_run(run, tag):
+    """HTMLタグのスタイル（太字、色）をWordのRunに適用する"""
+    # 太字判定
+    style_attr = tag.get('style', '').lower()
+    if tag.name in ['b', 'strong'] or 'font-weight:bold' in style_attr or 'font-weight: bold' in style_attr:
+        run.bold = True
+    
+    # 色判定 (style="color:..." または <font color="...">)
+    color = None
+    if 'color' in style_attr:
+        color = parse_color(style_attr)
+    elif tag.get('color'):
+        color = parse_color(tag.get('color'))
+        
+    if color:
+        run.font.color.rgb = color
+
+def process_element_to_docx(paragraph, element):
+    """HTML要素を再帰的に解析してWordに追加する"""
+    if isinstance(element, NavigableString):
+        text = str(element)
+        if text.strip(): # 空白だけの場合は無視するか、そのまま入れるか
+            paragraph.add_run(text)
+    
+    elif isinstance(element, Tag):
+        # 改行タグ
+        if element.name == 'br':
+            paragraph.add_run('\n')
+        
+        # コンテナタグの場合は中身を掘り下げる
+        elif element.name in ['span', 'font', 'b', 'strong', 'i', 'em', 'a']:
+            # このタグの中身をすべて取得
+            for child in element.children:
+                if isinstance(child, NavigableString):
+                    run = paragraph.add_run(str(child))
+                    apply_html_style_to_run(run, element)
+                elif isinstance(child, Tag):
+                    # ネストしている場合（<span><b>文字</b></span>など）
+                    # 再帰呼び出ししたいが、簡易的にスタイルを継承させる
+                    # 今回は「親のスタイル」を適用しつつ中身を追加
+                    process_element_to_docx(paragraph, child)
+                    # 注意: 厳密な継承は複雑になるため、直近のタグのスタイルを優先
+        
+        else:
+            # その他のタグは中身だけ展開
+            for child in element.children:
+                process_element_to_docx(paragraph, child)
 
 # ==========================================
-# Wordファイル作成
+# Wordファイル作成（リッチテキスト対応版）
 # ==========================================
-def create_docx(title, clean_text_list):
+def create_rich_docx(title_html, body_html):
     doc = Document()
-    doc.add_heading(title, 0)
     
-    for text in clean_text_list:
-        if text.strip():
-            doc.add_paragraph(text)
+    # --- タイトルの処理 ---
+    # HTML解析
+    soup_title = BeautifulSoup(title_html, 'html.parser')
+    p_title = doc.add_paragraph()
+    p_title.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    
+    # タイトルのスタイル適用（h1の中身を解析）
+    if soup_title.h1:
+        # H1タグそのもののスタイル
+        h1_tag = soup_title.h1
+        for child in h1_tag.children:
+            if isinstance(child, NavigableString):
+                run = p_title.add_run(str(child))
+                run.font.size = Pt(16)
+                run.bold = True
+            elif isinstance(child, Tag):
+                run = p_title.add_run(child.get_text())
+                run.font.size = Pt(16)
+                apply_html_style_to_run(run, child)
+    else:
+        # HTMLでなければそのままテキスト追加
+        p_title.add_run(soup_title.get_text()).font.size = Pt(16)
+
+    doc.add_paragraph("") # 空行
+
+    # --- 本文の処理 ---
+    soup_body = BeautifulSoup(body_html, 'html.parser')
+    
+    # ブロック要素ごとに段落を作る
+    # div, p, h2, h3 などを段落とみなす
+    blocks = soup_body.find_all(['p', 'div', 'h2', 'h3'], recursive=True)
+    
+    # もしfind_allでうまく階層が取れない場合、ルート直下を見る
+    if not blocks:
+        top_elements = soup_body.find_all(True, recursive=False)
+        blocks = top_elements if top_elements else [soup_body]
+
+    for block in blocks:
+        # ブロック内のテキストが空でなければ段落追加
+        if block.get_text(strip=True):
+            p = doc.add_paragraph()
+            process_element_to_docx(p, block)
             
     buffer = BytesIO()
     doc.save(buffer)
     buffer.seek(0)
     return buffer
-
-# ==========================================
-# PDFファイル作成
-# ==========================================
-def create_pdf(title, clean_text_list):
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4,
-                            rightMargin=20*mm, leftMargin=20*mm,
-                            topMargin=20*mm, bottomMargin=20*mm)
-    
-    # フォント準備
-    font_path = get_valid_japanese_font()
-    font_name = 'Helvetica' # 初期値（これだと文字化けする）
-    
-    if font_path:
-        try:
-            # フォント登録を試みる
-            pdfmetrics.registerFont(TTFont('Japanese', font_path))
-            font_name = 'Japanese'
-        except Exception as e:
-            # フォント自体が壊れている場合
-            print(f"Font error: {e}")
-            return None, False
-    else:
-        # フォントがダウンロードできなかった場合
-        # 壊れたPDFを作るくらいなら失敗として返す
-        return None, False
-
-    styles = getSampleStyleSheet()
-    
-    # 日本語対応スタイル
-    style_body = ParagraphStyle(name='JapaneseBody',
-                                parent=styles['Normal'],
-                                fontName=font_name,
-                                fontSize=10.5,
-                                leading=16,
-                                spaceAfter=6,
-                                alignment=TA_JUSTIFY)
-                                
-    style_title = ParagraphStyle(name='JapaneseTitle',
-                                 parent=styles['Heading1'],
-                                 fontName=font_name,
-                                 fontSize=16,
-                                 leading=20,
-                                 spaceAfter=20)
-
-    story = []
-    
-    # タイトル
-    story.append(Paragraph(title, style_title))
-    
-    # 本文
-    for text in clean_text_list:
-        if text.strip():
-            # 特殊文字エスケープ
-            safe_text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            story.append(Paragraph(safe_text, style_body))
-            story.append(Spacer(1, 2*mm))
-
-    try:
-        doc.build(story)
-        buffer.seek(0)
-        return buffer, True # 成功
-    except Exception:
-        return None, False
 
 # ==========================================
 # ブラウザ操作
@@ -218,32 +233,27 @@ def extract_target_content(html_content, target_url):
 
     # タイトル
     title_html = ""
-    title_text_clean = "タイトルなし"
     target_h1 = soup.find("h1", class_="pageTitle")
-    
     if target_h1:
         title_html = str(target_h1)
-        title_text_clean = target_h1.get_text(strip=True)
     else:
         target_h1 = soup.find("h1")
         if target_h1:
             title_html = str(target_h1)
-            title_text_clean = target_h1.get_text(strip=True)
-
-    simple_title_text = soup.title.get_text(strip=True) if soup.title else "抽出結果"
 
     # 本文
     body_html = "<div>本文が見つかりませんでした</div>"
-    text_list_for_file = []
     
     target_div = soup.find(id="sentenceBox")
     if not target_div:
         target_div = soup.find(id="main_txt")
 
     if target_div:
+        # ゴミ掃除
         for bad in target_div.find_all(["script", "noscript", "iframe", "form", "button", "input"]):
             bad.decompose()
 
+        # 文末カット
         cut_point = target_div.find(class_="kakomiPop2")
         if cut_point:
             for sibling in cut_point.find_next_siblings():
@@ -251,12 +261,8 @@ def extract_target_content(html_content, target_url):
             cut_point.decompose()
 
         body_html = str(target_div)
-        
-        for elem in target_div.find_all(['p', 'div', 'h2', 'h3', 'br']):
-            txt = elem.get_text(strip=True)
-            if txt:
-                text_list_for_file.append(txt)
 
+    # HTMLプレビュー作成
     final_html = f"""
     <!DOCTYPE html>
     <html>
@@ -292,15 +298,16 @@ def extract_target_content(html_content, target_url):
     </html>
     """
 
-    return simple_title_text, title_text_clean, text_list_for_file, final_html
+    # ここではHTML文字列そのものを返す（Word作成関数側でパースする）
+    return title_html, body_html, final_html
 
 # ==========================================
 # 画面構成
 # ==========================================
 st.set_page_config(page_title="H-Review Pro", layout="centered")
 
-st.title("💎 コンテンツ抽出アプリ")
-st.caption("抽出後、下のボタンから保存できます。")
+st.title("💎 色付きWord保存アプリ")
+st.caption("サイトの赤文字や強調をWordにそのまま保存します。")
 
 url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
@@ -317,46 +324,32 @@ if st.button("抽出を開始する", type="primary", use_container_width=True):
         if html:
             status.info("📄 データ生成中...")
             
-            page_title, article_title, text_list, final_html = extract_target_content(html, url)
+            # 抽出
+            title_html_str, body_html_str, final_html_preview = extract_target_content(html, url)
             
-            # --- 処理完了 ---
             status.empty()
             st.success("抽出完了！")
             
-            # === 保存ボタンエリア ===
-            col1, col2 = st.columns(2)
+            # --- 保存ボタンエリア ---
+            # 今回はWordに特化します（PDFはWordから保存してもらう方が確実なため）
             
-            with col1:
-                # Word
-                docx_file = create_docx(article_title, text_list)
-                st.download_button(
-                    label="📄 Wordで保存",
-                    data=docx_file,
-                    file_name="story.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True 
-                )
+            # 色付きWordを作成
+            docx_file = create_rich_docx(title_html_str, body_html_str)
             
-            with col2:
-                # PDF
-                pdf_file, pdf_success = create_pdf(article_title, text_list)
-                
-                if pdf_success:
-                    st.download_button(
-                        label="📕 PDFで保存",
-                        data=pdf_file,
-                        file_name="story.pdf",
-                        mime="application/pdf",
-                        use_container_width=True
-                    )
-                else:
-                    # フォントダウンロード失敗時
-                    st.error("⚠️ PDF用のフォント取得に失敗しました。時間をおいて試すか、Word保存をご利用ください。")
+            st.download_button(
+                label="📘 Word(.docx) で色付き保存",
+                data=docx_file,
+                file_name="story_colored.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True
+            )
             
+            st.info("💡 PDFが必要な場合は、保存したWordを開き「名前を付けて保存」からPDFを選んでください。文字化けせず一番きれいに保存できます。")
+
             st.divider()
             
-            # プレビュー表示
-            components.html(final_html, height=800, scrolling=True)
+            # プレビュー
+            components.html(final_html_preview, height=800, scrolling=True)
             
         else:
             status.error("読み込みに失敗しました。")
