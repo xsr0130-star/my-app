@@ -1,5 +1,5 @@
 import streamlit as st
-import streamlit.components.v1 as components  # ← これが重要：HTML表示用の部品
+import streamlit.components.v1 as components
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import time
@@ -55,16 +55,31 @@ def fetch_html_via_route(target_url):
             browser.close()
 
 # ==========================================
-# 抽出ロジック（色付き重視）
+# 抽出ロジック（CSSリンク完全保持版）
 # ==========================================
-def extract_colored_body(html_content):
+def extract_with_css(html_content, target_url):
     soup = BeautifulSoup(html_content, 'html.parser')
 
-    # 不要なタグ削除（色は残すため、fontやspanは消さない）
-    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "iframe", "form", "button", "input", "meta", "link", "img", "svg"]):
+    # 1. デザインに関わるタグ（link, style）をすべて抽出して保存しておく
+    # これがないと class="conversation" の色が分かりません
+    head_styles = []
+    
+    # 外部CSSファイルへのリンクを取得
+    for link in soup.find_all('link', rel='stylesheet'):
+        head_styles.append(str(link))
+        
+    # ページ内に直接書かれたスタイルを取得
+    for style in soup.find_all('style'):
+        head_styles.append(str(style))
+        
+    # スタイル群を結合
+    styles_html = "\n".join(head_styles)
+
+    # 2. 不要な要素の削除（scriptなどは消すが、デザイン系は残す）
+    for tag in soup(["script", "noscript", "iframe", "form", "button", "input", "img", "svg"]):
         tag.decompose()
 
-    # タイトル
+    # 3. タイトル取得
     title_text = "タイトルなし"
     h1 = soup.find('h1')
     if h1:
@@ -72,9 +87,9 @@ def extract_colored_body(html_content):
     elif soup.title:
         title_text = soup.title.get_text(strip=True)
 
-    # 本文（HTML保持）
+    # 4. 本文抽出
     max_score = 0
-    best_html = "<div>本文が見つかりませんでした</div>"
+    best_body_html = "<div>本文が見つかりませんでした</div>"
     
     candidates = soup.find_all(['div', 'article', 'section', 'main'])
 
@@ -82,7 +97,7 @@ def extract_colored_body(html_content):
         text = candidate.get_text(strip=True)
         score = len(text)
         
-        # リンク文字率が高いブロックを除外
+        # リンク文字率が高いブロック（メニュー等）を除外
         links = candidate.find_all('a')
         link_len = sum([len(a.get_text()) for a in links])
         if score > 0 and (link_len / score) > 0.5:
@@ -90,17 +105,41 @@ def extract_colored_body(html_content):
 
         if score > max_score:
             max_score = score
-            # ここでHTMLタグごと取得する
-            best_html = str(candidate)
+            best_body_html = str(candidate)
 
-    return title_text, best_html
+    # 5. 最終的なHTMLを組み立てる
+    # ここが重要： <base href="..."> を入れることで、相対パスのCSSを読み込めるようにする
+    final_html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <base href="{target_url}"> <!-- これで外部CSSファイルが読み込まれます -->
+        {styles_html} <!-- 元サイトのデザインルールを注入 -->
+        <style>
+            body {{
+                background-color: #fff;
+                padding: 20px;
+                font-family: sans-serif;
+            }}
+            /* 画像を消した跡地が崩れないように調整 */
+            img {{ display: none !important; }}
+        </style>
+    </head>
+    <body>
+        {best_body_html}
+    </body>
+    </html>
+    """
+
+    return title_text, final_html
 
 # ==========================================
 # 画面構成
 # ==========================================
-st.set_page_config(page_title="Review Extractor", layout="centered")
-st.title("🌈 完全色付き抽出アプリ")
-st.caption("サイトのデザイン（色・太字）をそのまま表示します。")
+st.set_page_config(page_title="H-Review Pro", layout="centered")
+st.title("🌈 デザイン完全再現アプリ")
+st.caption("CSSクラス（conversation等）も反映して表示します。")
 
 url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
@@ -114,34 +153,17 @@ if st.button("抽出開始"):
         html = fetch_html_via_route(url)
 
         if html:
-            title, body_html = extract_colored_body(html)
+            # URLも渡す（Base URL設定のため）
+            title, final_html = extract_with_css(html, url)
+            
             status.empty()
             
             st.success("完了")
             st.subheader(title)
             st.divider()
             
-            # 【ここが変更点】
-            # HTMLを見やすくするためのCSSを追加して、iframeの中に表示します
-            custom_css = """
-            <style>
-                body {
-                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-                    line-height: 1.6;
-                    color: #333;
-                    background-color: #fff;
-                    padding: 10px;
-                }
-                /* 強調色の補正 */
-                .red, .danger, .marker { color: red !important; font-weight: bold; }
-            </style>
-            """
-            
-            # 抽出したHTMLにCSSをくっつける
-            final_html = custom_css + body_html
-            
-            # iframeとして表示（これで色が守られます）
-            components.html(final_html, height=600, scrolling=True)
+            # iframeで表示（外部CSSを読み込ませるため）
+            components.html(final_html, height=800, scrolling=True)
             
             st.divider()
         else:
