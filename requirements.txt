@@ -1,3 +1,6 @@
 streamlit
 playwright
 beautifulsoup4
+python-docx
+reportlab
+requests
