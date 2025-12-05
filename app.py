@@ -79,7 +79,7 @@ def fetch_html_force_clean(target_url):
             browser.close()
 
 # ==========================================
-# 抽出ロジック（タイトル＋sentenceBox）
+# 抽出ロジック（kakomiPop2以降カット機能追加）
 # ==========================================
 def extract_target_content(html_content, target_url):
     soup = BeautifulSoup(html_content, 'html.parser')
@@ -93,42 +93,49 @@ def extract_target_content(html_content, target_url):
     style_html = "\n".join(styles)
 
     # -------------------------------------------------
-    # 2. タイトルの抽出 (h1 class="pageTitle")
+    # 2. タイトルの抽出
     # -------------------------------------------------
     title_html = ""
-    # 指定されたクラスを持つh1を探す
     target_h1 = soup.find("h1", class_="pageTitle")
-    
     if target_h1:
-        # HTMLごと取得（中のspanタグの色などを残すため）
         title_html = str(target_h1)
     else:
-        # なければ普通のh1を探す
         target_h1 = soup.find("h1")
         if target_h1:
             title_html = str(target_h1)
 
-    # アプリのヘッダー表示用にテキストだけも取得しておく
     simple_title_text = soup.title.get_text(strip=True) if soup.title else "抽出結果"
 
     # -------------------------------------------------
-    # 3. 本文の抽出 (id="sentenceBox")
+    # 3. 本文の抽出 & 不要部分のカット
     # -------------------------------------------------
     body_html = "<div>本文が見つかりませんでした</div>"
     target_div = soup.find(id="sentenceBox")
 
-    # なければ予備のIDを探す
     if not target_div:
         target_div = soup.find(id="main_txt")
 
     if target_div:
-        # 不要なタグ掃除
+        # (A) 基本的なゴミ掃除
         for bad in target_div.find_all(["script", "noscript", "iframe", "form", "button", "input"]):
             bad.decompose()
+
+        # (B) 【追加機能】kakomiPop2 を見つけたら、そこから下を全削除
+        # class="kakomiPop2" を持つ要素を探す
+        cut_point = target_div.find(class_="kakomiPop2")
+        
+        if cut_point:
+            # その要素より後ろにある兄弟要素（弟たち）をすべて削除
+            for sibling in cut_point.find_next_siblings():
+                sibling.decompose()
+            # その要素自身（kakomiPop2）も削除
+            cut_point.decompose()
+
+        # HTMLとして取得
         body_html = str(target_div)
 
     # -------------------------------------------------
-    # 4. 合体して表示用HTMLを作る
+    # 4. 合体
     # -------------------------------------------------
     final_html = f"""
     <!DOCTYPE html>
@@ -144,7 +151,7 @@ def extract_target_content(html_content, target_url):
                 font-family: sans-serif;
                 overflow: auto !important;
             }}
-            /* タイトルを見やすく調整 */
+            /* タイトル調整 */
             h1.pageTitle {{
                 font-size: 20px;
                 margin-bottom: 20px;
@@ -152,18 +159,15 @@ def extract_target_content(html_content, target_url):
                 padding-bottom: 10px;
                 line-height: 1.4;
             }}
-            /* 本文の調整 */
+            /* 本文調整 */
             #sentenceBox {{
                 font-size: 16px;
                 line-height: 1.8;
                 color: #333;
             }}
-            /* 画像を消す設定（必要ならコメントアウト解除） */
-            /* img {{ display: none !important; }} */
         </style>
     </head>
     <body>
-        <!-- ここに抽出したタイトルと本文を並べる -->
         {title_html}
         {body_html}
     </body>
@@ -176,8 +180,8 @@ def extract_target_content(html_content, target_url):
 # 画面構成
 # ==========================================
 st.set_page_config(page_title="H-Review Master", layout="centered")
-st.title("💎 完全版リーダー")
-st.caption("指定されたタイトルと本文を構造通りに抽出します。")
+st.title("✂️ 文末カット対応リーダー")
+st.caption("「この話の続き」などの不要なリンク集を自動で削除します。")
 
 url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
@@ -191,13 +195,12 @@ if st.button("抽出する"):
         html = fetch_html_force_clean(url)
 
         if html:
-            status.text("タイトルと本文を結合中...")
+            status.text("不要ブロックをカット中...")
             simple_title, final_html = extract_target_content(html, url)
             status.empty()
             
             st.success("完了")
             
-            # iframeで表示
             components.html(final_html, height=800, scrolling=True)
             
         else:
