@@ -39,37 +39,39 @@ if "setup_done" not in st.session_state:
         st.session_state.setup_done = True
 
 # ==========================================
-# 【重要】日本語フォント確保（厳密なチェック付き）
+# 【修正】日本語フォント確保（Google Fonts利用）
 # ==========================================
 def get_valid_japanese_font():
-    font_filename = "IPAexGothic.ttf"
-    # 安定したGitHubのRaw URL
-    font_url = "https://raw.githubusercontent.com/minoryorg/ipaex-font/master/ipaexg.ttf"
-    
-    # 1. 既存ファイルのチェック（壊れていたら消す）
-    if os.path.exists(font_filename):
-        # フォントファイルは約4MB以上あるはず。2MB以下なら壊れているとみなす
-        if os.path.getsize(font_filename) < 2 * 1024 * 1024:
-            os.remove(font_filename)
+    # 以前の壊れたファイルがあれば削除する（クリーンアップ）
+    old_font = "IPAexGothic.ttf"
+    if os.path.exists(old_font):
+        os.remove(old_font)
 
-    # 2. ダウンロード（ファイルがない場合）
-    if not os.path.exists(font_filename):
+    font_filename = "NotoSansJP-Regular.ttf"
+    # Google Fontsの公式Rawデータ（安定・高速）
+    font_url = "https://github.com/google/fonts/raw/main/ofl/notosansjp/NotoSansJP-Regular.ttf"
+    
+    # ファイルがない、またはサイズがおかしい場合は再ダウンロード
+    if not os.path.exists(font_filename) or os.path.getsize(font_filename) < 1000:
         try:
-            response = requests.get(font_url, timeout=60)
+            # 以前の残骸を消す
+            if os.path.exists(font_filename):
+                os.remove(font_filename)
+                
+            response = requests.get(font_url, timeout=30)
             if response.status_code == 200:
                 with open(font_filename, "wb") as f:
                     f.write(response.content)
-                
-                # ダウンロード直後にもサイズチェック
-                if os.path.getsize(font_filename) < 2 * 1024 * 1024:
-                    os.remove(font_filename) # 失敗したので消す
-                    return None
             else:
                 return None
         except Exception:
             return None
             
-    return font_filename if os.path.exists(font_filename) else None
+    # 最終チェック：ファイルが存在し、サイズが十分か
+    if os.path.exists(font_filename) and os.path.getsize(font_filename) > 1000000:
+        return font_filename
+    else:
+        return None
 
 # ==========================================
 # Wordファイル作成
@@ -98,18 +100,21 @@ def create_pdf(title, clean_text_list):
     
     # フォント準備
     font_path = get_valid_japanese_font()
+    font_name = 'Helvetica' # 初期値（これだと文字化けする）
     
-    # フォントが確保できた場合のみ登録
     if font_path:
         try:
+            # フォント登録を試みる
             pdfmetrics.registerFont(TTFont('Japanese', font_path))
             font_name = 'Japanese'
-        except Exception:
-            # 登録に失敗したら英語フォント（文字化けするがエラーで落ちないようにする）
-            font_name = 'Helvetica'
+        except Exception as e:
+            # フォント自体が壊れている場合
+            print(f"Font error: {e}")
+            return None, False
     else:
-        # ダウンロード失敗時
-        font_name = 'Helvetica'
+        # フォントがダウンロードできなかった場合
+        # 壊れたPDFを作るくらいなら失敗として返す
+        return None, False
 
     styles = getSampleStyleSheet()
     
@@ -145,12 +150,12 @@ def create_pdf(title, clean_text_list):
     try:
         doc.build(story)
         buffer.seek(0)
-        return buffer, True # 成功フラグ
+        return buffer, True # 成功
     except Exception:
         return None, False
 
 # ==========================================
-# ブラウザ操作（JSでポップアップ破壊）
+# ブラウザ操作
 # ==========================================
 def fetch_html_force_clean(target_url):
     with sync_playwright() as p:
@@ -318,7 +323,7 @@ if st.button("抽出を開始する", type="primary", use_container_width=True):
             status.empty()
             st.success("抽出完了！")
             
-            # === 保存ボタンエリア (メイン画面・横並び) ===
+            # === 保存ボタンエリア ===
             col1, col2 = st.columns(2)
             
             with col1:
@@ -329,22 +334,24 @@ if st.button("抽出を開始する", type="primary", use_container_width=True):
                     data=docx_file,
                     file_name="story.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True # スマホで見やすく幅一杯に
+                    use_container_width=True 
                 )
             
             with col2:
                 # PDF
                 pdf_file, pdf_success = create_pdf(article_title, text_list)
+                
                 if pdf_success:
                     st.download_button(
                         label="📕 PDFで保存",
                         data=pdf_file,
                         file_name="story.pdf",
                         mime="application/pdf",
-                        use_container_width=True # スマホで見やすく幅一杯に
+                        use_container_width=True
                     )
                 else:
-                    st.error("PDF用フォントエラー")
+                    # フォントダウンロード失敗時
+                    st.error("⚠️ PDF用のフォント取得に失敗しました。時間をおいて試すか、Word保存をご利用ください。")
             
             st.divider()
             
