@@ -33,36 +33,62 @@ if "setup_done" not in st.session_state:
         st.session_state.setup_done = True
 
 # ==========================================
-# 色解析ロジック
+# 【強化】色解析ロジック（多色・RGB対応）
 # ==========================================
 def get_rgb_from_str(color_str):
+    """
+    あらゆる色指定文字列からRGBColorオブジェクトを返す
+    対応: 色名(red, hotpink...), Hex(#FFF, #FFFFFF), rgb(r,g,b)
+    """
     if not color_str: return None
-    c = color_str.lower().strip()
     
-    # Hex
+    # 小文字化 & 不要な !important などを削除
+    c = color_str.lower().strip().replace('!important', '').strip()
+    
+    # 1. Hex 6桁 (#RRGGBB)
     hex_match = re.search(r'#([0-9a-f]{6})', c)
     if hex_match:
         h = hex_match.group(1)
         return RGBColor(int(h[:2], 16), int(h[2:4], 16), int(h[4:], 16))
-    
-    # 基本色マップ
+        
+    # 2. Hex 3桁 (#RGB) -> #RRGGBB に変換
+    hex_match_short = re.search(r'#([0-9a-f]{3})\b', c)
+    if hex_match_short:
+        h = hex_match_short.group(1)
+        return RGBColor(int(h[0]*2, 16), int(h[1]*2, 16), int(h[2]*2, 16))
+        
+    # 3. rgb(r, g, b) 表記
+    rgb_match = re.search(r'rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)', c)
+    if rgb_match:
+        return RGBColor(int(rgb_match.group(1)), int(rgb_match.group(2)), int(rgb_match.group(3)))
+
+    # 4. 拡張色名マップ（Web標準色を網羅）
     colors = {
-        'red': RGBColor(255, 0, 0),
-        'blue': RGBColor(0, 0, 255),
-        'green': RGBColor(0, 128, 0),
+        # 基本色
+        'red': RGBColor(255, 0, 0), 'blue': RGBColor(0, 0, 255), 'green': RGBColor(0, 128, 0),
+        'black': RGBColor(0, 0, 0), 'white': RGBColor(255, 255, 255),
+        'gray': RGBColor(128, 128, 128), 'grey': RGBColor(128, 128, 128),
+        # サイトでよく使われる色
         'lightseagreen': RGBColor(32, 178, 170),
-        'pink': RGBColor(255, 192, 203),
-        'orange': RGBColor(255, 165, 0),
-        'purple': RGBColor(128, 0, 128),
-        'gray': RGBColor(128, 128, 128),
-        'black': RGBColor(0, 0, 0)
+        'orange': RGBColor(255, 165, 0), 'darkorange': RGBColor(255, 140, 0), 'orangered': RGBColor(255, 69, 0),
+        'pink': RGBColor(255, 192, 203), 'lightpink': RGBColor(255, 182, 193), 'hotpink': RGBColor(255, 105, 180), 'deeppink': RGBColor(255, 20, 147),
+        'purple': RGBColor(128, 0, 128), 'violet': RGBColor(238, 130, 238), 'magenta': RGBColor(255, 0, 255), 'fuchsia': RGBColor(255, 0, 255),
+        'cyan': RGBColor(0, 255, 255), 'aqua': RGBColor(0, 255, 255),
+        'yellow': RGBColor(255, 255, 0), 'gold': RGBColor(255, 215, 0),
+        'brown': RGBColor(165, 42, 42), 'maroon': RGBColor(128, 0, 0),
+        'lime': RGBColor(0, 255, 0), 'limegreen': RGBColor(50, 205, 50),
+        'navy': RGBColor(0, 0, 128), 'teal': RGBColor(0, 128, 128),
+        'silver': RGBColor(192, 192, 192),
     }
-    return colors.get(c.split()[0])
+    
+    return colors.get(c)
 
 def parse_css_colors(soup):
+    """CSS内のクラス定義から色を抽出"""
     css_map = {}
     for style in soup.find_all('style'):
         if style.string:
+            # .classname { color: red; } を抽出
             matches = re.finditer(r'\.([a-zA-Z0-9_-]+)\s*\{[^}]*color\s*:\s*([^;\}]+)', style.string, re.IGNORECASE)
             for m in matches:
                 class_name = m.group(1)
@@ -70,13 +96,23 @@ def parse_css_colors(soup):
                 rgb = get_rgb_from_str(color_val)
                 if rgb:
                     css_map[class_name] = rgb
-    css_map.update({
-        'conversation': RGBColor(255, 0, 0),
-        'marker': RGBColor(255, 0, 0)
-    })
+                    
+    # よくある固定クラスのデフォルト値
+    defaults = {
+        'conversation': RGBColor(255, 0, 0), # デフォルト赤
+        'marker': RGBColor(255, 0, 0),
+        'red': RGBColor(255, 0, 0),
+        'blue': RGBColor(0, 0, 255),
+        'pink': RGBColor(255, 105, 180)
+    }
+    for k, v in defaults.items():
+        if k not in css_map:
+            css_map[k] = v
+            
     return css_map
 
 def apply_style_to_run(run, element, css_map):
+    """WordのRunにスタイルを適用（多色対応）"""
     style_attr = element.get('style', '').lower()
     classes = element.get('class', [])
     
@@ -84,18 +120,23 @@ def apply_style_to_run(run, element, css_map):
     if element.name in ['b', 'strong', 'h1', 'h2'] or 'font-weight:bold' in style_attr or 'bold' in classes:
         run.bold = True
         
-    # 色
+    # 色判定
     rgb = None
+    
+    # 1. style="color: ..."
     if 'color' in style_attr:
+        # color: xxx; の xxx を取り出す
         m = re.search(r'color\s*:\s*([^;"]+)', style_attr)
         if m: rgb = get_rgb_from_str(m.group(1))
     
+    # 2. class="..."
     if not rgb and classes:
         for cls in classes:
             if cls in css_map:
                 rgb = css_map[cls]
                 break
                 
+    # 3. <font color="...">
     if not rgb and element.get('color'):
         rgb = get_rgb_from_str(element.get('color'))
 
@@ -103,49 +144,36 @@ def apply_style_to_run(run, element, css_map):
         run.font.color.rgb = rgb
 
 # ==========================================
-# Word作成エンジン（改行対応版）
+# Word作成エンジン（改行対応）
 # ==========================================
-# 改行を入れるべきブロック要素のリスト
-BLOCK_TAGS = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'li', 'article', 'section', 'header', 'footer']
+BLOCK_TAGS = ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'li', 'article', 'section']
 
 def process_node_recursive(paragraph, node, css_map):
-    """再帰的にノードを処理してWordに追加"""
+    """再帰的にノードを処理"""
     if isinstance(node, NavigableString):
         text = str(node)
-        # 本文以外のシステムコメントを除外
         if "contents_within" not in text and text.strip():
-            # テキストを追加
             run = paragraph.add_run(text)
             if node.parent:
                 apply_style_to_run(run, node.parent, css_map)
                 
     elif isinstance(node, Tag):
-        # 1. 改行タグの場合
         if node.name == 'br':
             paragraph.add_run('\n')
-            
-        # 2. 無視するタグ
         elif node.name in ['script', 'style', 'noscript']:
             pass
-            
-        # 3. その他のタグ
         else:
-            # ブロック要素の場合、処理の前後に改行の概念があるが、
-            # 再帰処理内では「中身を処理した後に改行を追加」するのが安全
-            
-            # 子要素を再帰処理
             for child in node.children:
                 process_node_recursive(paragraph, child, css_map)
             
-            # 【重要】ブロック要素が終わったら改行を入れる
-            # ただし、最後の要素でなければ
+            # ブロック要素の終わりで改行
             if node.name in BLOCK_TAGS:
                 paragraph.add_run('\n')
 
 def create_rich_docx(title_html, body_html, css_map):
     doc = Document()
     
-    # --- タイトル ---
+    # タイトル
     soup_title = BeautifulSoup(title_html, 'html.parser')
     p_title = doc.add_paragraph()
     p_title.alignment = WD_ALIGN_PARAGRAPH.LEFT
@@ -155,31 +183,21 @@ def create_rich_docx(title_html, body_html, css_map):
         run.font.size = Pt(16)
         if not run.bold: run.bold = True
 
-    doc.add_paragraph("") # 空行
+    doc.add_paragraph("") 
 
-    # --- 本文 ---
+    # 本文
     soup_body = BeautifulSoup(body_html, 'html.parser')
     
-    # 以前のようにfind_allでブロックを分けると入れ子が崩れるため、
-    # 全体を1つの大きな段落として処理しつつ、内部で '\n' を挟む戦略をとる
-    # または、ルート直下のブロックごとに段落を分ける
-    
-    # ルート直下の要素を取得
+    # ルート直下の要素ごとに段落作成
     top_level_elements = soup_body.find_all(True, recursive=False)
     
     if not top_level_elements:
-        # ルート直下にテキストしかない場合
         p = doc.add_paragraph()
         process_node_recursive(p, soup_body, css_map)
     else:
         for element in top_level_elements:
-            # 新しい段落を作成
             p = doc.add_paragraph()
-            # その要素の中身を再帰的に追加（内部の改行は '\n' になる）
             process_node_recursive(p, element, css_map)
-            
-            # 段落間の余白調整（オプション）
-            # p.paragraph_format.space_after = Pt(6)
     
     buffer = BytesIO()
     doc.save(buffer)
@@ -236,15 +254,13 @@ def fetch_html_force_clean(target_url):
             browser.close()
 
 # ==========================================
-# 抽出ロジック（クリーニング強化）
+# 抽出ロジック（警告削除・文末カット）
 # ==========================================
 def extract_target_content(html_content, target_url):
     soup = BeautifulSoup(html_content, 'html.parser')
 
-    # CSS解析
     css_map = parse_css_colors(soup)
     
-    # 表示用スタイル
     styles = []
     for link in soup.find_all('link', rel='stylesheet'):
         styles.append(str(link))
@@ -252,7 +268,6 @@ def extract_target_content(html_content, target_url):
         styles.append(str(style))
     style_html = "\n".join(styles)
 
-    # タイトル
     title_html = ""
     target_h1 = soup.find("h1", class_="pageTitle")
     if target_h1:
@@ -262,9 +277,7 @@ def extract_target_content(html_content, target_url):
         if target_h1:
             title_html = str(target_h1)
 
-    # 本文
     body_html = "<div>本文が見つかりませんでした</div>"
-    
     target_div = soup.find(id="sentenceBox")
     if not target_div:
         target_div = soup.find(id="main_txt")
@@ -285,7 +298,7 @@ def extract_target_content(html_content, target_url):
                 sibling.decompose()
             cut_point.decompose()
 
-        # 警告文削除（テキストベース判定）
+        # 警告文削除
         bad_words = ["無断転載", "Googleに通報", "刑事告訴", "民事訴訟", "エチケン", "contents_within"]
         for tag in target_div.find_all(['p', 'div', 'span', 'font', 'b']):
             text = tag.get_text()
@@ -339,7 +352,7 @@ def extract_target_content(html_content, target_url):
 st.set_page_config(page_title="H-Review Final", layout="centered")
 
 st.title("💎 完成版コンテンツ抽出")
-st.caption("警告文削除・改行対応・色付きWord保存")
+st.caption("警告削除・改行・多色対応")
 
 url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
