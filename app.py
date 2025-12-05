@@ -33,137 +33,150 @@ if "setup_done" not in st.session_state:
         st.session_state.setup_done = True
 
 # ==========================================
-# 【新機能】HTMLの色をWordの色に変換するロジック
+# 【修正】色解析ロジック（Hex, RGB, 色名対応）
 # ==========================================
-def parse_color(style_str):
-    """style属性やcolor属性からRGB値を返す"""
-    if not style_str:
+def get_rgb_from_str(color_str):
+    """文字列（red, #ff0000等）からRGBColorオブジェクトを返す"""
+    if not color_str:
         return None
     
-    # 1. Hexコード (#FF0000) を探す
-    hex_match = re.search(r'#([0-9a-fA-F]{6})', style_str)
-    if hex_match:
-        hex_code = hex_match.group(1)
-        return RGBColor(int(hex_code[:2], 16), int(hex_code[2:4], 16), int(hex_code[4:], 16))
+    color_str = color_str.lower().strip()
     
-    # 2. 一般的な色名を探す（h-kenでよく使われる色）
-    style_lower = style_str.lower()
+    # 1. Hex (#RRGGBB)
+    hex_match = re.search(r'#([0-9a-f]{6})', color_str)
+    if hex_match:
+        h = hex_match.group(1)
+        return RGBColor(int(h[:2], 16), int(h[2:4], 16), int(h[4:], 16))
+    
+    # 2. 色名マップ（サイトで使われそうな色）
     colors = {
         'red': RGBColor(255, 0, 0),
         'blue': RGBColor(0, 0, 255),
         'green': RGBColor(0, 128, 0),
-        'lightseagreen': RGBColor(32, 178, 170), # タイトルによくある色
+        'lightseagreen': RGBColor(32, 178, 170), # タイトルの色
         'pink': RGBColor(255, 192, 203),
         'orange': RGBColor(255, 165, 0),
         'purple': RGBColor(128, 0, 128),
         'gray': RGBColor(128, 128, 128),
         'grey': RGBColor(128, 128, 128),
-        'bold': None # 色ではないがスタイルにある場合
+        'black': RGBColor(0, 0, 0),
+        'white': RGBColor(255, 255, 255)
     }
     
-    for name, rgb in colors.items():
-        if name in style_lower:
-            return rgb
+    return colors.get(color_str)
+
+def apply_styles_recursive(run, element):
+    """
+    文字(NavigableString)から親タグを遡ってスタイル（色・太字）を探し、
+    WordのRunに適用する
+    """
+    # 親、その親、さらにその親...と3階層くらい遡ってスタイルを探す
+    # 例: <span style="color:red"><b>文字</b></span> の場合、bには色がないがspanにある
+    
+    current = element.parent
+    font_color_set = False
+    bold_set = False
+    
+    # 最大3階層さかのぼる
+    for _ in range(3):
+        if not current or current.name in ['div', 'p', 'body', 'html', '[document]']:
+            break
+        
+        # スタイル属性を取得
+        style_attr = current.get('style', '').lower()
+        tag_name = current.name
+        
+        # --- 太字判定 ---
+        if not bold_set:
+            if tag_name in ['b', 'strong'] or 'font-weight:bold' in style_attr or 'font-weight: bold' in style_attr:
+                run.bold = True
+                bold_set = True
+
+        # --- 色判定 ---
+        if not font_color_set:
+            color_val = None
             
-    return None
-
-def apply_html_style_to_run(run, tag):
-    """HTMLタグのスタイル（太字、色）をWordのRunに適用する"""
-    # 太字判定
-    style_attr = tag.get('style', '').lower()
-    if tag.name in ['b', 'strong'] or 'font-weight:bold' in style_attr or 'font-weight: bold' in style_attr:
-        run.bold = True
-    
-    # 色判定 (style="color:..." または <font color="...">)
-    color = None
-    if 'color' in style_attr:
-        color = parse_color(style_attr)
-    elif tag.get('color'):
-        color = parse_color(tag.get('color'))
+            # 1. <font color="...">
+            if current.get('color'):
+                color_val = current.get('color')
+            
+            # 2. style="color: ..."
+            elif 'color' in style_attr:
+                # 正規表現で color: の後ろの値を取り出す
+                m = re.search(r'color\s*:\s*([^;"]+)', style_attr)
+                if m:
+                    color_val = m.group(1)
+            
+            if color_val:
+                rgb = get_rgb_from_str(color_val)
+                if rgb:
+                    run.font.color.rgb = rgb
+                    font_color_set = True
         
-    if color:
-        run.font.color.rgb = color
-
-def process_element_to_docx(paragraph, element):
-    """HTML要素を再帰的に解析してWordに追加する"""
-    if isinstance(element, NavigableString):
-        text = str(element)
-        if text.strip(): # 空白だけの場合は無視するか、そのまま入れるか
-            paragraph.add_run(text)
-    
-    elif isinstance(element, Tag):
-        # 改行タグ
-        if element.name == 'br':
-            paragraph.add_run('\n')
-        
-        # コンテナタグの場合は中身を掘り下げる
-        elif element.name in ['span', 'font', 'b', 'strong', 'i', 'em', 'a']:
-            # このタグの中身をすべて取得
-            for child in element.children:
-                if isinstance(child, NavigableString):
-                    run = paragraph.add_run(str(child))
-                    apply_html_style_to_run(run, element)
-                elif isinstance(child, Tag):
-                    # ネストしている場合（<span><b>文字</b></span>など）
-                    # 再帰呼び出ししたいが、簡易的にスタイルを継承させる
-                    # 今回は「親のスタイル」を適用しつつ中身を追加
-                    process_element_to_docx(paragraph, child)
-                    # 注意: 厳密な継承は複雑になるため、直近のタグのスタイルを優先
-        
-        else:
-            # その他のタグは中身だけ展開
-            for child in element.children:
-                process_element_to_docx(paragraph, child)
+        current = current.parent
 
 # ==========================================
-# Wordファイル作成（リッチテキスト対応版）
+# Word作成エンジン（再帰処理）
 # ==========================================
+def add_html_elements_to_paragraph(paragraph, soup_element):
+    """HTML要素を解析してWord段落に追加する（再帰）"""
+    for child in soup_element.children:
+        if isinstance(child, NavigableString):
+            text = str(child)
+            # 改行コードは除去せず、Word側で制御
+            if text:
+                run = paragraph.add_run(text)
+                # ここで親タグを遡ってスタイルを適用
+                apply_styles_recursive(run, child)
+                
+        elif isinstance(child, Tag):
+            if child.name == 'br':
+                paragraph.add_run('\n')
+            else:
+                # さらに中身を掘り下げる
+                add_html_elements_to_paragraph(paragraph, child)
+
 def create_rich_docx(title_html, body_html):
     doc = Document()
     
-    # --- タイトルの処理 ---
-    # HTML解析
+    # --- タイトル ---
     soup_title = BeautifulSoup(title_html, 'html.parser')
     p_title = doc.add_paragraph()
     p_title.alignment = WD_ALIGN_PARAGRAPH.LEFT
     
-    # タイトルのスタイル適用（h1の中身を解析）
+    # タイトル内の解析
     if soup_title.h1:
-        # H1タグそのもののスタイル
-        h1_tag = soup_title.h1
-        for child in h1_tag.children:
-            if isinstance(child, NavigableString):
-                run = p_title.add_run(str(child))
-                run.font.size = Pt(16)
-                run.bold = True
-            elif isinstance(child, Tag):
-                run = p_title.add_run(child.get_text())
-                run.font.size = Pt(16)
-                apply_html_style_to_run(run, child)
+        add_html_elements_to_paragraph(p_title, soup_title.h1)
     else:
-        # HTMLでなければそのままテキスト追加
-        p_title.add_run(soup_title.get_text()).font.size = Pt(16)
+        # H1がない場合
+        run = p_title.add_run(soup_title.get_text())
+    
+    # タイトル全体を大きく
+    for run in p_title.runs:
+        run.font.size = Pt(16)
+        if not run.bold: run.bold = True # タイトルは強制太字
 
     doc.add_paragraph("") # 空行
 
-    # --- 本文の処理 ---
+    # --- 本文 ---
     soup_body = BeautifulSoup(body_html, 'html.parser')
     
-    # ブロック要素ごとに段落を作る
-    # div, p, h2, h3 などを段落とみなす
-    blocks = soup_body.find_all(['p', 'div', 'h2', 'h3'], recursive=True)
+    # ブロック要素ごとに段落を分ける
+    # div, p, h2~h6
+    blocks = soup_body.find_all(['div', 'p', 'h2', 'h3', 'h4', 'blockquote'], recursive=False)
     
-    # もしfind_allでうまく階層が取れない場合、ルート直下を見る
+    # ルート直下にテキストがある場合の対応
     if not blocks:
-        top_elements = soup_body.find_all(True, recursive=False)
-        blocks = top_elements if top_elements else [soup_body]
-
-    for block in blocks:
-        # ブロック内のテキストが空でなければ段落追加
-        if block.get_text(strip=True):
-            p = doc.add_paragraph()
-            process_element_to_docx(p, block)
-            
+        # 再帰的に探すのではなく、このdivそのものを1つのブロックとして扱う
+        p = doc.add_paragraph()
+        add_html_elements_to_paragraph(p, soup_body)
+    else:
+        for block in blocks:
+            # テキストが含まれているか確認
+            if block.get_text(strip=True):
+                p = doc.add_paragraph()
+                add_html_elements_to_paragraph(p, block)
+    
     buffer = BytesIO()
     doc.save(buffer)
     buffer.seek(0)
@@ -189,7 +202,7 @@ def fetch_html_force_clean(target_url):
             page.wait_for_load_state("domcontentloaded")
             time.sleep(2) 
 
-            # ポップアップ破壊
+            # ポップアップ破壊JS
             page.evaluate("""
                 () => {
                     const keywords = ['はい', 'YES', 'Yes', '18歳', 'Enter', '入り口', '入場'];
@@ -219,11 +232,12 @@ def fetch_html_force_clean(target_url):
             browser.close()
 
 # ==========================================
-# 抽出ロジック
+# 抽出ロジック（警告削除機能追加）
 # ==========================================
 def extract_target_content(html_content, target_url):
     soup = BeautifulSoup(html_content, 'html.parser')
 
+    # CSS確保
     styles = []
     for link in soup.find_all('link', rel='stylesheet'):
         styles.append(str(link))
@@ -231,7 +245,7 @@ def extract_target_content(html_content, target_url):
         styles.append(str(style))
     style_html = "\n".join(styles)
 
-    # タイトル
+    # タイトル抽出
     title_html = ""
     target_h1 = soup.find("h1", class_="pageTitle")
     if target_h1:
@@ -241,7 +255,7 @@ def extract_target_content(html_content, target_url):
         if target_h1:
             title_html = str(target_h1)
 
-    # 本文
+    # 本文抽出
     body_html = "<div>本文が見つかりませんでした</div>"
     
     target_div = soup.find(id="sentenceBox")
@@ -249,20 +263,29 @@ def extract_target_content(html_content, target_url):
         target_div = soup.find(id="main_txt")
 
     if target_div:
-        # ゴミ掃除
+        # 1. 基本的なゴミ掃除
         for bad in target_div.find_all(["script", "noscript", "iframe", "form", "button", "input"]):
             bad.decompose()
 
-        # 文末カット
+        # 2. 文末カット（kakomiPop2以降）
         cut_point = target_div.find(class_="kakomiPop2")
         if cut_point:
             for sibling in cut_point.find_next_siblings():
                 sibling.decompose()
             cut_point.decompose()
 
+        # 3. 【追加】不要な警告文（著作権など）の削除
+        # "無断転載はご遠慮願います" を含む pタグや divタグを探して消す
+        for tag in target_div.find_all(['p', 'div', 'span']):
+            text = tag.get_text()
+            if "無断転載はご遠慮願います" in text or "Googleに通報します" in text or "エチケン" in text:
+                # 本文ごと消えないように、文字数が極端に多い場合は消さない（警告文は通常短い）
+                if len(text) < 300: 
+                    tag.decompose()
+
         body_html = str(target_div)
 
-    # HTMLプレビュー作成
+    # HTMLプレビュー
     final_html = f"""
     <!DOCTYPE html>
     <html>
@@ -298,7 +321,6 @@ def extract_target_content(html_content, target_url):
     </html>
     """
 
-    # ここではHTML文字列そのものを返す（Word作成関数側でパースする）
     return title_html, body_html, final_html
 
 # ==========================================
@@ -307,11 +329,10 @@ def extract_target_content(html_content, target_url):
 st.set_page_config(page_title="H-Review Pro", layout="centered")
 
 st.title("💎 色付きWord保存アプリ")
-st.caption("サイトの赤文字や強調をWordにそのまま保存します。")
+st.caption("不要な警告文を削除し、色を維持してWord化します。")
 
 url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
-# 全幅ボタン
 if st.button("抽出を開始する", type="primary", use_container_width=True):
     if not url:
         st.warning("URLを入力してください。")
@@ -324,14 +345,11 @@ if st.button("抽出を開始する", type="primary", use_container_width=True):
         if html:
             status.info("📄 データ生成中...")
             
-            # 抽出
+            # 抽出処理
             title_html_str, body_html_str, final_html_preview = extract_target_content(html, url)
             
             status.empty()
             st.success("抽出完了！")
-            
-            # --- 保存ボタンエリア ---
-            # 今回はWordに特化します（PDFはWordから保存してもらう方が確実なため）
             
             # 色付きWordを作成
             docx_file = create_rich_docx(title_html_str, body_html_str)
@@ -344,11 +362,11 @@ if st.button("抽出を開始する", type="primary", use_container_width=True):
                 use_container_width=True
             )
             
-            st.info("💡 PDFが必要な場合は、保存したWordを開き「名前を付けて保存」からPDFを選んでください。文字化けせず一番きれいに保存できます。")
+            st.info("💡 Wordを開き「PDFとして保存」すると、きれいにPDF化できます。")
 
             st.divider()
             
-            # プレビュー
+            # プレビュー表示
             components.html(final_html_preview, height=800, scrolling=True)
             
         else:
