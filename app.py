@@ -36,20 +36,15 @@ if "setup_done" not in st.session_state:
 # 便利関数：ファイル名用クリーニング
 # ==========================================
 def sanitize_filename(text):
-    """ファイル名に使えない文字を削除し、長さを制限する"""
+    """ファイル名に使えない文字を削除"""
     if not text:
         return "story"
-    
-    # Windows/Macで禁止されている文字（\ / : * ? " < > |）を削除
+    # 禁止文字を全角などに置換するか削除
     text = re.sub(r'[\\/*?:"<>|]', "", text)
-    # 改行やタブを削除
     text = text.replace('\n', '').replace('\r', '').replace('\t', '')
-    # 前後の空白削除
     text = text.strip()
-    # 長すぎるとエラーになるので50文字程度にカット
-    if len(text) > 50:
-        text = text[:50]
-        
+    if len(text) > 60: # 長すぎるとエラーになるのでカット
+        text = text[:60]
     return text if text else "story"
 
 # ==========================================
@@ -103,26 +98,35 @@ def apply_style_to_run(run, element):
             if rgb: run.font.color.rgb = rgb
 
 # ==========================================
-# Word作成エンジン
+# Word作成エンジン（空白行対応版）
 # ==========================================
 BLOCK_TAGS = ['p', 'div', 'h1', 'h2', 'h3', 'blockquote', 'li', 'article', 'section']
 
 def process_node_recursive(paragraph, node):
     if isinstance(node, NavigableString):
         text = str(node)
-        if "contents_within" not in text and text.strip():
-            run = paragraph.add_run(text)
-            if node.parent:
-                apply_style_to_run(run, node.parent)
+        # 本文以外のシステムコメントを除外
+        if "contents_within" not in text:
+            # 空白だけのテキストも、改行の意味を持つことがあるので完全無視はしない
+            # ただしWordでは連続する空白は無視されるため、意味のある文字があるか確認
+            if text.strip():
+                run = paragraph.add_run(text)
+                if node.parent:
+                    apply_style_to_run(run, node.parent)
                 
     elif isinstance(node, Tag):
         if node.name == 'br':
+            # <br> は確実に改行させる
             paragraph.add_run('\n')
         elif node.name in ['script', 'style', 'noscript']:
             pass
         else:
+            # 子要素を処理
             for child in node.children:
                 process_node_recursive(paragraph, child)
+            
+            # ブロック要素が終わったら改行を入れる
+            # これにより <p>あ</p><p>い</p> がくっつかずに改行される
             if node.name in BLOCK_TAGS:
                 paragraph.add_run('\n')
 
@@ -143,14 +147,21 @@ def create_rich_docx(title_html, body_html):
 
     # 本文
     soup_body = BeautifulSoup(body_html, 'html.parser')
+    
+    # ルート直下の要素ごとに段落を作成する方式に変更
+    # これにより、大きなブロック間の余白が自然になる
     top_level_elements = soup_body.find_all(True, recursive=False)
     
     if not top_level_elements:
+        # 要素がない（テキスト直書きなど）場合は1つの段落で
         p = doc.add_paragraph()
         process_node_recursive(p, soup_body)
     else:
         for element in top_level_elements:
             p = doc.add_paragraph()
+            # 行間を少し詰めたい場合はここを調整（デフォルトは広め）
+            # p.paragraph_format.space_after = Pt(0) 
+            
             process_node_recursive(p, element)
     
     buffer = BytesIO()
@@ -223,7 +234,7 @@ def fetch_html_force_clean(target_url):
             browser.close()
 
 # ==========================================
-# 抽出ロジック（ファイル名取得機能追加）
+# 抽出ロジック
 # ==========================================
 def extract_target_content(html_content, target_url):
     soup = BeautifulSoup(html_content, 'html.parser')
@@ -235,9 +246,9 @@ def extract_target_content(html_content, target_url):
         styles.append(str(style))
     style_html = "\n".join(styles)
 
-    # タイトル取得（HTML版とテキスト版）
+    # タイトル取得
     title_html = ""
-    title_text_clean = "無題" # 初期値
+    title_text_clean = "無題"
     
     target_h1 = soup.find("h1", class_="pageTitle")
     if target_h1:
@@ -248,8 +259,7 @@ def extract_target_content(html_content, target_url):
         if target_h1:
             title_html = str(target_h1)
             title_text_clean = target_h1.get_text(strip=True)
-            
-    # もしH1がなければページの<title>タグを使う
+    
     if title_text_clean == "無題" and soup.title:
         title_text_clean = soup.title.get_text(strip=True)
 
@@ -296,7 +306,6 @@ def extract_target_content(html_content, target_url):
     </html>
     """
 
-    # タイトルテキストも一緒に返す
     return title_html, body_html, final_html, title_text_clean
 
 # ==========================================
@@ -305,7 +314,7 @@ def extract_target_content(html_content, target_url):
 st.set_page_config(page_title="H-Review Ultra", layout="centered")
 
 st.title("💎 究極版コンテンツ抽出")
-st.caption("全色対応・警告削除・改行対応・ファイル名自動")
+st.caption("全色対応・空白行維持・ファイル名自動化")
 
 url = st.text_input("読みたい記事のURL", placeholder="https://...")
 
@@ -321,7 +330,6 @@ if st.button("抽出を開始する", type="primary", use_container_width=True):
         if html:
             status.info("📄 データ生成中...")
             
-            # title_text_clean を受け取る
             title_html_str, body_html_str, final_html_preview, title_text_clean = extract_target_content(html, url)
             
             status.empty()
@@ -330,13 +338,13 @@ if st.button("抽出を開始する", type="primary", use_container_width=True):
             # Word作成
             docx_file = create_rich_docx(title_html_str, body_html_str)
             
-            # ファイル名を生成（安全な文字に変換）
+            # ファイル名設定
             safe_filename = sanitize_filename(title_text_clean) + ".docx"
             
             st.download_button(
                 label=f"📘 「{safe_filename}」で保存",
                 data=docx_file,
-                file_name=safe_filename, # ここでファイル名を指定
+                file_name=safe_filename,
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 use_container_width=True
             )
