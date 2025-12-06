@@ -36,15 +36,10 @@ if "setup_done" not in st.session_state:
 # 便利関数：ファイル名用クリーニング
 # ==========================================
 def sanitize_filename(text):
-    """ファイル名に使えない文字を削除"""
-    if not text:
-        return "story"
-    # 禁止文字を全角などに置換するか削除
+    if not text: return "story"
     text = re.sub(r'[\\/*?:"<>|]', "", text)
-    text = text.replace('\n', '').replace('\r', '').replace('\t', '')
-    text = text.strip()
-    if len(text) > 60: # 長すぎるとエラーになるのでカット
-        text = text[:60]
+    text = text.replace('\n', '').replace('\r', '').replace('\t', '').strip()
+    if len(text) > 60: text = text[:60]
     return text if text else "story"
 
 # ==========================================
@@ -53,19 +48,13 @@ def sanitize_filename(text):
 def get_rgb_from_str(color_str):
     if not color_str: return None
     c = color_str.lower().strip()
-    
-    # rgba(...)
     rgb_match = re.search(r'rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)', c)
     if rgb_match:
         return RGBColor(int(rgb_match.group(1)), int(rgb_match.group(2)), int(rgb_match.group(3)))
-
-    # Hex
     hex_match = re.search(r'#([0-9a-f]{6})', c)
     if hex_match:
         h = hex_match.group(1)
         return RGBColor(int(h[:2], 16), int(h[2:4], 16), int(h[4:], 16))
-    
-    # 基本マップ
     colors = {
         'red': RGBColor(255, 0, 0), 'blue': RGBColor(0, 0, 255), 'green': RGBColor(0, 128, 0),
         'black': RGBColor(0, 0, 0), 'white': RGBColor(255, 255, 255),
@@ -75,14 +64,11 @@ def get_rgb_from_str(color_str):
     return colors.get(c.split()[0])
 
 def apply_style_to_run(run, element):
-    """データ属性(data-calc-color)を見てスタイル適用"""
     calc_color = element.get('data-calc-color')
     calc_bold = element.get('data-calc-bold')
     
-    if calc_bold == 'true':
-        run.bold = True
-    elif element.name in ['b', 'strong', 'h1', 'h2']:
-        run.bold = True
+    if calc_bold == 'true': run.bold = True
+    elif element.name in ['b', 'strong', 'h1', 'h2']: run.bold = True
         
     if calc_color:
         rgb = get_rgb_from_str(calc_color)
@@ -98,35 +84,25 @@ def apply_style_to_run(run, element):
             if rgb: run.font.color.rgb = rgb
 
 # ==========================================
-# Word作成エンジン（空白行対応版）
+# Word作成エンジン（再帰・空白行対応）
 # ==========================================
 BLOCK_TAGS = ['p', 'div', 'h1', 'h2', 'h3', 'blockquote', 'li', 'article', 'section']
 
 def process_node_recursive(paragraph, node):
     if isinstance(node, NavigableString):
         text = str(node)
-        # 本文以外のシステムコメントを除外
-        if "contents_within" not in text:
-            # 空白だけのテキストも、改行の意味を持つことがあるので完全無視はしない
-            # ただしWordでは連続する空白は無視されるため、意味のある文字があるか確認
-            if text.strip():
-                run = paragraph.add_run(text)
-                if node.parent:
-                    apply_style_to_run(run, node.parent)
+        if text.strip():
+            run = paragraph.add_run(text)
+            if node.parent: apply_style_to_run(run, node.parent)
                 
     elif isinstance(node, Tag):
         if node.name == 'br':
-            # <br> は確実に改行させる
             paragraph.add_run('\n')
         elif node.name in ['script', 'style', 'noscript']:
             pass
         else:
-            # 子要素を処理
             for child in node.children:
                 process_node_recursive(paragraph, child)
-            
-            # ブロック要素が終わったら改行を入れる
-            # これにより <p>あ</p><p>い</p> がくっつかずに改行される
             if node.name in BLOCK_TAGS:
                 paragraph.add_run('\n')
 
@@ -148,21 +124,27 @@ def create_rich_docx(title_html, body_html):
     # 本文
     soup_body = BeautifulSoup(body_html, 'html.parser')
     
-    # ルート直下の要素ごとに段落を作成する方式に変更
-    # これにより、大きなブロック間の余白が自然になる
-    top_level_elements = soup_body.find_all(True, recursive=False)
-    
-    if not top_level_elements:
-        # 要素がない（テキスト直書きなど）場合は1つの段落で
-        p = doc.add_paragraph()
-        process_node_recursive(p, soup_body)
-    else:
-        for element in top_level_elements:
-            p = doc.add_paragraph()
-            # 行間を少し詰めたい場合はここを調整（デフォルトは広め）
-            # p.paragraph_format.space_after = Pt(0) 
+    # 【変更点】childrenをループして、マーカーがあれば空段落を追加
+    # これにより、警告文があった場所に「空白行」が生まれる
+    for element in soup_body.children:
+        if isinstance(element, Tag):
+            # 空白行マーカーの判定
+            if 'doc-blank-line' in element.get('class', []):
+                doc.add_paragraph("") # 空白行を追加
+                continue
             
+            # 通常の要素
+            p = doc.add_paragraph()
             process_node_recursive(p, element)
+            
+            # 段落内のテキストが空で、かつ画像等もない場合は段落削除してもいいが、
+            # 改行維持のため残すのが無難
+            
+        elif isinstance(element, NavigableString):
+            text = str(element).strip()
+            if text:
+                p = doc.add_paragraph()
+                p.add_run(text)
     
     buffer = BytesIO()
     doc.save(buffer)
@@ -191,7 +173,6 @@ def fetch_html_force_clean(target_url):
 
             page.evaluate("""
                 () => {
-                    // ポップアップ破壊
                     const keywords = ['はい', 'YES', 'Yes', '18歳', 'Enter', '入り口', '入場'];
                     const buttons = document.querySelectorAll('a, button, div, span');
                     for (let btn of buttons) {
@@ -209,7 +190,6 @@ def fetch_html_force_clean(target_url):
                     document.body.style.overflow = 'visible';
                     document.body.style.height = 'auto';
                     
-                    // 色情報焼き付け
                     const targetArea = document.getElementById('sentenceBox') || document.body;
                     const allElements = targetArea.querySelectorAll('*');
                     allElements.forEach(el => {
@@ -234,7 +214,7 @@ def fetch_html_force_clean(target_url):
             browser.close()
 
 # ==========================================
-# 抽出ロジック
+# 抽出ロジック（マーカー置換機能付き）
 # ==========================================
 def extract_target_content(html_content, target_url):
     soup = BeautifulSoup(html_content, 'html.parser')
@@ -246,10 +226,8 @@ def extract_target_content(html_content, target_url):
         styles.append(str(style))
     style_html = "\n".join(styles)
 
-    # タイトル取得
     title_html = ""
     title_text_clean = "無題"
-    
     target_h1 = soup.find("h1", class_="pageTitle")
     if target_h1:
         title_html = str(target_h1)
@@ -259,7 +237,6 @@ def extract_target_content(html_content, target_url):
         if target_h1:
             title_html = str(target_h1)
             title_text_clean = target_h1.get_text(strip=True)
-    
     if title_text_clean == "無題" and soup.title:
         title_text_clean = soup.title.get_text(strip=True)
 
@@ -269,21 +246,39 @@ def extract_target_content(html_content, target_url):
         target_div = soup.find(id="main_txt")
 
     if target_div:
+        # 【重要】警告文やコメントを「透明な空白行マーカー」に置換する
+        
+        # 1. HTMLコメントの処理
         for comment in target_div.find_all(string=lambda text: isinstance(text, Comment)):
-            comment.extract()
+            # 警告文っぽいコメントならマーカーに置換
+            c_text = str(comment)
+            if "contents_within" in c_text or "エチケン" in c_text:
+                new_tag = soup.new_tag("div", **{"class": "doc-blank-line"})
+                comment.replace_with(new_tag)
+            else:
+                comment.extract() # それ以外はただ消す
+
+        # 2. 不要タグ削除
         for bad in target_div.find_all(["script", "noscript", "iframe", "form", "button", "input"]):
             bad.decompose()
+
+        # 3. 文末カット
         cut_point = target_div.find(class_="kakomiPop2")
         if cut_point:
             for sibling in cut_point.find_next_siblings():
                 sibling.decompose()
             cut_point.decompose()
-        bad_words = ["無断転載", "Googleに通報", "刑事告訴", "民事訴訟", "エチケン", "contents_within"]
+
+        # 4. 警告文タグの処理
+        bad_words = ["無断転載", "Googleに通報", "刑事告訴", "民事訴訟", "エチケン"]
         for tag in target_div.find_all(['p', 'div', 'span', 'font', 'b']):
             text = tag.get_text()
             if any(w in text for w in bad_words):
                 if len(text) < 400:
-                    tag.decompose()
+                    # ただ消すのではなく、空白行マーカーに置き換える
+                    new_tag = soup.new_tag("div", **{"class": "doc-blank-line"})
+                    tag.replace_with(new_tag)
+
         body_html = str(target_div)
 
     final_html = f"""
@@ -297,6 +292,8 @@ def extract_target_content(html_content, target_url):
             body {{ background-color: #fff; padding: 15px; font-family: sans-serif; overflow: auto !important; }}
             h1.pageTitle {{ font-size: 20px; margin-bottom: 20px; border-bottom: 1px solid #ccc; padding-bottom: 10px; line-height: 1.4; }}
             #sentenceBox {{ font-size: 16px; line-height: 1.8; color: #333; }}
+            /* アプリ上のプレビューではマーカーは見えなくて良い（あるいは少し余白を取る） */
+            .doc-blank-line {{ height: 1em; }}
         </style>
     </head>
     <body>
